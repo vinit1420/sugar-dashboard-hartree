@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 from datetime import datetime
 from pathlib import Path
 
@@ -149,7 +150,17 @@ def reports_to_dataframe(reports: list[ProcessedReport]) -> pd.DataFrame:
     return frame
 
 
+def _replace_nan_with_none(value):
+    if isinstance(value, dict):
+        return {key: _replace_nan_with_none(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_replace_nan_with_none(item) for item in value]
+    if isinstance(value, float) and math.isnan(value):
+        return None
+    return value
+
+
 def latest_row(frame: pd.DataFrame) -> DashboardRow | None:
     if frame.empty:
         return None
-    return DashboardRow.model_validate(frame.iloc[-1].to_dict())
+    return DashboardRow.model_validate(_replace_nan_with_none(frame.iloc[-1].to_dict()))
