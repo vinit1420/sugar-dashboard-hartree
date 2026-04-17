@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 
 import altair as alt
 import pandas as pd
@@ -150,7 +151,49 @@ def _build_trend_chart(frame: pd.DataFrame) -> alt.Chart:
 
 
 def _build_market_regime_display(selected: pd.Series) -> tuple[str, str]:
-    primary = selected["market_regime"] or selected["regime_label"] or "N/A"
+    extracted_regime = selected["market_regime"]
+    derived_regime = selected["regime_label"]
+    context = " ".join(
+        part for part in [selected["macro_summary"], selected["key_driver"], selected["trade_summary"]] if part
+    ).lower()
+
+    bullish_signals = (
+        "price higher",
+        "prices higher",
+        "pushing prices higher",
+        "upside risk",
+        "tight",
+        "supportive",
+        "bullish",
+        "move higher",
+        "rally",
+        "raising expectations",
+    )
+    bearish_signals = (
+        "oversupply",
+        "comfortable",
+        "soft",
+        "bearish",
+        "limited upside",
+        "downside",
+        "weaker prices",
+    )
+
+    extracted_regime_lc = (extracted_regime or "").strip().lower()
+    bullish_context = any(signal in context for signal in bullish_signals)
+    bearish_context = any(signal in context for signal in bearish_signals)
+
+    if extracted_regime_lc == "bearish" and bullish_context:
+        primary = "Supportive / upside risk"
+    elif extracted_regime_lc == "bullish" and bearish_context:
+        primary = "Soft / limited upside"
+    elif extracted_regime:
+        primary = extracted_regime
+    else:
+        primary = derived_regime or "N/A"
+
+    if primary:
+        primary = re.sub(r"^\w", lambda match: match.group(0).upper(), primary)
     helper = selected["macro_summary"] or selected["key_driver"] or "No regime context extracted."
     return primary, helper
 
