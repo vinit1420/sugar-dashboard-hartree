@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+from typing import Any
 
 import altair as alt
 import pandas as pd
@@ -113,14 +114,45 @@ def _section_card(title: str, body: str) -> None:
 def _format_number(value: float | int | None, suffix: str = "", decimals: int = 1) -> str:
     if value is None:
         return "N/A"
+    if isinstance(value, float) and pd.isna(value):
+        return "N/A"
     return f"{value:,.{decimals}f}{suffix}"
 
 
 def _format_change(value: float | None) -> str:
     if value is None:
         return "N/A"
+    if isinstance(value, float) and pd.isna(value):
+        return "N/A"
     sign = "+" if value > 0 else ""
     return f"{sign}{value:.2f}%"
+
+
+def _is_missing(value: Any) -> bool:
+    if value is None:
+        return True
+    if isinstance(value, float) and pd.isna(value):
+        return True
+    return False
+
+
+def _optional_text(value: Any) -> str | None:
+    if _is_missing(value):
+        return None
+    text = str(value).strip()
+    if not text or text.lower() == "nan":
+        return None
+    return text
+
+
+def _text_value(value: Any, fallback: str) -> str:
+    return _optional_text(value) or fallback
+
+
+def _list_value(value: Any) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    return [str(item) for item in value if not _is_missing(item)]
 
 
 def _build_trend_chart(frame: pd.DataFrame) -> alt.Chart:
@@ -152,10 +184,16 @@ def _build_trend_chart(frame: pd.DataFrame) -> alt.Chart:
 
 
 def _build_market_regime_display(selected: pd.Series) -> tuple[str, str]:
-    extracted_regime = selected["market_regime"]
-    derived_regime = selected["regime_label"]
+    extracted_regime = _optional_text(selected["market_regime"])
+    derived_regime = _optional_text(selected["regime_label"])
     context = " ".join(
-        part for part in [selected["macro_summary"], selected["key_driver"], selected["trade_summary"]] if part
+        part
+        for part in [
+            _optional_text(selected["macro_summary"]),
+            _optional_text(selected["key_driver"]),
+            _optional_text(selected["trade_summary"]),
+        ]
+        if part
     ).lower()
 
     bullish_signals = (
@@ -195,12 +233,16 @@ def _build_market_regime_display(selected: pd.Series) -> tuple[str, str]:
 
     if primary:
         primary = re.sub(r"^\w", lambda match: match.group(0).upper(), primary)
-    helper = selected["macro_summary"] or selected["key_driver"] or "No regime context extracted."
+    helper = (
+        _optional_text(selected["macro_summary"])
+        or _optional_text(selected["key_driver"])
+        or "No regime context extracted."
+    )
     return primary, helper
 
 
 def _build_key_driver_display(selected: pd.Series) -> tuple[str, str]:
-    primary = selected["key_driver"] or "N/A"
+    primary = _text_value(selected["key_driver"], "N/A")
     helper = "Main market-moving catalyst for the selected month."
     return primary, helper
 
@@ -215,7 +257,7 @@ def _render_supply_section(selected: pd.Series) -> None:
                     f"<strong>Cane crush:</strong> {_format_number(selected['brazil_cane_crush_mmt'], ' mmt')}",
                     f"<strong>Sugar production:</strong> {_format_number(selected['brazil_sugar_production_mmt'], ' mmt')}",
                     f"<strong>Sugar mix:</strong> {_format_number(selected['brazil_sugar_mix_pct'], '%')}",
-                    f"<strong>Note:</strong> {selected['brazil_note'] or 'No Brazil-specific note extracted.'}",
+                    f"<strong>Note:</strong> {_text_value(selected['brazil_note'], 'No Brazil-specific note extracted.')}",
                 ]
             ),
         )
@@ -226,8 +268,8 @@ def _render_supply_section(selected: pd.Series) -> None:
                 [
                     f"<strong>Current production:</strong> {_format_number(selected['india_current_production_mmt'], ' mmt')}",
                     f"<strong>Final outlook:</strong> {_format_number(selected['india_final_outlook_mmt'], ' mmt')}",
-                    f"<strong>Exports:</strong> {selected['india_exports_note'] or 'No India-specific export note extracted.'}",
-                    f"<strong>Note:</strong> {selected['india_note'] or 'No India-specific note extracted.'}",
+                    f"<strong>Exports:</strong> {_text_value(selected['india_exports_note'], 'No India-specific export note extracted.')}",
+                    f"<strong>Note:</strong> {_text_value(selected['india_note'], 'No India-specific note extracted.')}",
                 ]
             ),
         )
@@ -238,7 +280,7 @@ def _render_supply_section(selected: pd.Series) -> None:
                 [
                     f"<strong>Production outlook:</strong> {_format_number(selected['thailand_production_outlook_mmt'], ' mmt')}",
                     f"<strong>Ethanol diversion:</strong> {_format_number(selected['thailand_ethanol_diversion_kmt'], ' kmt')}",
-                    f"<strong>Note:</strong> {selected['thailand_note'] or 'No Thailand-specific note extracted.'}",
+                    f"<strong>Note:</strong> {_text_value(selected['thailand_note'], 'No Thailand-specific note extracted.')}",
                 ]
             ),
         )
@@ -251,9 +293,9 @@ def _render_trade_section(selected: pd.Series) -> None:
             "Trade / Risk",
             "<br>".join(
                 [
-                    f"<strong>Major disruption:</strong> {selected['major_trade_disruption'] or 'None highlighted.'}",
-                    f"<strong>Trade summary:</strong> {selected['trade_summary'] or 'No trade summary extracted.'}",
-                    f"<strong>Positioning:</strong> {selected['market_positioning_note'] or 'No positioning note extracted.'}",
+                    f"<strong>Major disruption:</strong> {_text_value(selected['major_trade_disruption'], 'None highlighted.')}",
+                    f"<strong>Trade summary:</strong> {_text_value(selected['trade_summary'], 'No trade summary extracted.')}",
+                    f"<strong>Positioning:</strong> {_text_value(selected['market_positioning_note'], 'No positioning note extracted.')}",
                 ]
             ),
         )
@@ -262,9 +304,9 @@ def _render_trade_section(selected: pd.Series) -> None:
             "Market Tone",
             "<br>".join(
                 [
-                    f"<strong>Key driver:</strong> {selected['key_driver'] or 'No key driver extracted.'}",
-                    f"<strong>Market regime:</strong> {selected['market_regime'] or 'No regime extracted.'}",
-                    f"<strong>Why traders care:</strong> {selected['macro_summary'] or 'No concise market framing extracted.'}",
+                    f"<strong>Key driver:</strong> {_text_value(selected['key_driver'], 'No key driver extracted.')}",
+                    f"<strong>Market regime:</strong> {_text_value(selected['market_regime'], 'No regime extracted.')}",
+                    f"<strong>Why traders care:</strong> {_text_value(selected['macro_summary'], 'No concise market framing extracted.')}",
                 ]
             ),
         )
@@ -272,14 +314,14 @@ def _render_trade_section(selected: pd.Series) -> None:
 
 def _render_summary_panel(selected: pd.Series) -> None:
     st.markdown("### AI Summary Panel")
-    _section_card("Executive Summary", selected["executive_summary"] or "No executive summary extracted.")
+    _section_card("Executive Summary", _text_value(selected["executive_summary"], "No executive summary extracted."))
     col1, col2 = st.columns(2)
     with col1:
-        bullets = selected["what_changed"] or []
+        bullets = _list_value(selected["what_changed"])
         formatted = "".join(f"<li>{item}</li>" for item in bullets) or "<li>No changes extracted.</li>"
         _section_card("What Changed", f"<ul class='bullet-list'>{formatted}</ul>")
     with col2:
-        bullets = selected["why_it_matters"] or []
+        bullets = _list_value(selected["why_it_matters"])
         formatted = "".join(f"<li>{item}</li>" for item in bullets) or "<li>No impact notes extracted.</li>"
         _section_card("Why It Matters", f"<ul class='bullet-list'>{formatted}</ul>")
 
@@ -319,7 +361,7 @@ def _render_margin_rag_demo() -> None:
             }
             for item in result.evidence
         ]
-        st.dataframe(evidence_rows, use_container_width=True, hide_index=True)
+        st.dataframe(evidence_rows, width="stretch", hide_index=True)
 
         for item in result.evidence:
             with st.expander(f"{item.record.source_type}: {item.record.title}"):
@@ -342,7 +384,7 @@ def _render_evidence_panel(selected: pd.Series, show_raw_evidence: bool) -> None
             st.markdown("**Source snippets**")
             st.json(selected["source_snippets"])
             st.markdown("**Extracted text preview**")
-            st.text(selected["extracted_text_preview"] or "No preview available.")
+            st.text(_text_value(selected["extracted_text_preview"], "No preview available."))
 
 
 def run_app() -> None:
@@ -370,7 +412,7 @@ def run_app() -> None:
     reports: list = []
     force_reextract = False
     with top_col2:
-        force_reextract = st.button("Re-extract reports", use_container_width=True)
+        force_reextract = st.button("Re-extract reports", width="stretch")
     with top_col3:
         show_raw_evidence = st.toggle("Show raw evidence", value=False)
 
@@ -422,7 +464,7 @@ def run_app() -> None:
         )
 
     st.markdown("### Price Trend")
-    st.altair_chart(_build_trend_chart(frame), use_container_width=True)
+    st.altair_chart(_build_trend_chart(frame), width="stretch")
     caption = (
         "Blue shows NY11 in cents per pound, while the dashed amber line shows Brent in dollars per barrel so you can compare direction rather than absolute level."
     )
