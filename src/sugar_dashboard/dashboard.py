@@ -8,6 +8,7 @@ import pandas as pd
 import streamlit as st
 
 from sugar_dashboard.pipeline import latest_row, load_reports, reports_to_dataframe
+from sugar_dashboard.rag_workflow import generate_margin_answer
 
 
 def _inject_styles() -> None:
@@ -283,6 +284,49 @@ def _render_summary_panel(selected: pd.Series) -> None:
         _section_card("Why It Matters", f"<ul class='bullet-list'>{formatted}</ul>")
 
 
+def _render_margin_rag_demo() -> None:
+    st.markdown("### Liquid Feed Margin RAG Workflow")
+    st.caption(
+        "A prototype workflow for the interview use case: grounded margin explanation across ERP, procurement, logistics, and market commentary."
+    )
+
+    default_question = "Why did liquid feed margin tighten in the Gulf region last month?"
+    question = st.text_input("Commercial analyst question", value=default_question)
+    result = generate_margin_answer(question)
+
+    workflow_tab, answer_tab, evidence_tab = st.tabs(["Workflow", "Grounded Answer", "Retrieved Evidence"])
+
+    with workflow_tab:
+        for index, step in enumerate(result.workflow_steps, start=1):
+            st.markdown(f"**{index}. {step}**")
+
+    with answer_tab:
+        _section_card("Question", result.question)
+        _section_card("Generated Explanation", result.answer)
+        _section_card("Confidence", result.confidence)
+
+    with evidence_tab:
+        evidence_rows = [
+            {
+                "Source": item.record.source_type,
+                "Title": item.record.title,
+                "Region": item.record.region,
+                "Period": item.record.period,
+                "Retrieval score": item.retrieval_score,
+                "Rerank score": item.rerank_score,
+                "Matched terms": ", ".join(item.matched_terms),
+                "Citation": item.record.citation,
+            }
+            for item in result.evidence
+        ]
+        st.dataframe(evidence_rows, use_container_width=True, hide_index=True)
+
+        for item in result.evidence:
+            with st.expander(f"{item.record.source_type}: {item.record.title}"):
+                st.write(item.record.text)
+                st.caption(item.record.citation)
+
+
 def _render_evidence_panel(selected: pd.Series, show_raw_evidence: bool) -> None:
     if not show_raw_evidence:
         return
@@ -389,6 +433,8 @@ def run_app() -> None:
 
     st.markdown("### Trade / Risk")
     _render_trade_section(selected)
+
+    _render_margin_rag_demo()
 
     _render_summary_panel(selected)
     _render_evidence_panel(selected, show_raw_evidence)
