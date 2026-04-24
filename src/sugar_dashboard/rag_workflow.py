@@ -8,10 +8,10 @@ from sugar_dashboard.models import ProcessedReport
 
 
 SUGGESTED_QUESTIONS = [
-    "Why did liquid feed margin tighten in the Gulf region last month?",
     "Why did NY11 move higher in March 2026?",
     "What changed in Brazil supply across the latest reports?",
     "How did oil and ethanol influence the sugar market?",
+    "What were the biggest trade or supply risks in the latest report?",
 ]
 
 

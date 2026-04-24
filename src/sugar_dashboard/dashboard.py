@@ -312,20 +312,6 @@ def _render_trade_section(selected: pd.Series) -> None:
         )
 
 
-def _render_summary_panel(selected: pd.Series) -> None:
-    st.markdown("### AI Summary Panel")
-    _section_card("Executive Summary", _text_value(selected["executive_summary"], "No executive summary extracted."))
-    col1, col2 = st.columns(2)
-    with col1:
-        bullets = _list_value(selected["what_changed"])
-        formatted = "".join(f"<li>{item}</li>" for item in bullets) or "<li>No changes extracted.</li>"
-        _section_card("What Changed", f"<ul class='bullet-list'>{formatted}</ul>")
-    with col2:
-        bullets = _list_value(selected["why_it_matters"])
-        formatted = "".join(f"<li>{item}</li>" for item in bullets) or "<li>No impact notes extracted.</li>"
-        _section_card("Why It Matters", f"<ul class='bullet-list'>{formatted}</ul>")
-
-
 def _render_report_rag_demo(reports: list) -> None:
     st.markdown("### Report Q&A")
     st.caption(
@@ -487,5 +473,4 @@ def run_app() -> None:
 
     _render_report_rag_demo(reports)
 
-    _render_summary_panel(selected)
     _render_evidence_panel(selected, show_raw_evidence)
