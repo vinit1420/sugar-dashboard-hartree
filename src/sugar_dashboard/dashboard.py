@@ -9,7 +9,7 @@ import pandas as pd
 import streamlit as st
 
 from sugar_dashboard.pipeline import latest_row, load_reports, reports_to_dataframe
-from sugar_dashboard.rag_workflow import generate_margin_answer
+from sugar_dashboard.rag_workflow import SUGGESTED_QUESTIONS, answer_report_question
 
 
 def _inject_styles() -> None:
@@ -326,25 +326,31 @@ def _render_summary_panel(selected: pd.Series) -> None:
         _section_card("Why It Matters", f"<ul class='bullet-list'>{formatted}</ul>")
 
 
-def _render_margin_rag_demo() -> None:
-    st.markdown("### Liquid Feed Margin RAG Workflow")
+def _render_report_rag_demo(reports: list) -> None:
+    st.markdown("### Report Q&A")
     st.caption(
-        "A prototype workflow for the interview use case: grounded margin explanation across ERP, procurement, logistics, and market commentary."
+        "Ask grounded questions across the loaded ED&F Man sugar reports. If the reports do not support an answer, the assistant will say so."
     )
 
-    default_question = "Why did liquid feed margin tighten in the Gulf region last month?"
-    question = st.text_input("Commercial analyst question", value=default_question)
-    result = generate_margin_answer(question)
+    st.markdown("**Suggestions**")
+    suggestion_cols = st.columns(2)
+    for index, suggestion in enumerate(SUGGESTED_QUESTIONS):
+        with suggestion_cols[index % 2]:
+            if st.button(suggestion, key=f"rag_suggestion_{index}", width="stretch"):
+                st.session_state["report_rag_question"] = suggestion
 
-    workflow_tab, answer_tab, evidence_tab = st.tabs(["Workflow", "Grounded Answer", "Retrieved Evidence"])
+    default_question = SUGGESTED_QUESTIONS[0]
+    if "report_rag_question" not in st.session_state:
+        st.session_state["report_rag_question"] = default_question
 
-    with workflow_tab:
-        for index, step in enumerate(result.workflow_steps, start=1):
-            st.markdown(f"**{index}. {step}**")
+    question = st.text_input("Ask a question", key="report_rag_question")
+    result = answer_report_question(question, reports)
+
+    answer_tab, evidence_tab = st.tabs(["Answer", "Evidence"])
 
     with answer_tab:
         _section_card("Question", result.question)
-        _section_card("Generated Explanation", result.answer)
+        _section_card("Answer", result.answer.replace("\n", "<br>"))
         _section_card("Confidence", result.confidence)
 
     with evidence_tab:
@@ -361,7 +367,10 @@ def _render_margin_rag_demo() -> None:
             }
             for item in result.evidence
         ]
-        st.dataframe(evidence_rows, width="stretch", hide_index=True)
+        if evidence_rows:
+            st.dataframe(evidence_rows, width="stretch", hide_index=True)
+        else:
+            st.info("No report evidence was retrieved for this question.")
 
         for item in result.evidence:
             with st.expander(f"{item.record.source_type}: {item.record.title}"):
@@ -476,7 +485,7 @@ def run_app() -> None:
     st.markdown("### Trade / Risk")
     _render_trade_section(selected)
 
-    _render_margin_rag_demo()
+    _render_report_rag_demo(reports)
 
     _render_summary_panel(selected)
     _render_evidence_panel(selected, show_raw_evidence)
