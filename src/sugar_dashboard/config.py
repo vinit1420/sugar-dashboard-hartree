@@ -10,6 +10,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 ROOT_DIR = Path(__file__).resolve().parents[2]
 REPORTS_DIR = ROOT_DIR / "reports"
 PROCESSED_DIR = ROOT_DIR / "data" / "processed"
+REPORT_SOURCE_URL = "https://www.edfmansugar.com/sugar-reports/"
 
 
 class Settings(BaseSettings):

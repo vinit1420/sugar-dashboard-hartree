@@ -93,3 +93,15 @@ OPENAI_API_KEY = "your_key_here"
 - Clicking `Re-extract reports` triggers fresh OpenAI extraction.
 - `.env` is ignored and is not committed to GitHub.
 
+## Scheduled Report Updates
+
+The repo includes a GitHub Actions workflow that can refresh the dashboard data automatically.
+
+- Workflow: `.github/workflows/update-reports.yml`
+- Schedule: daily at 12:30 UTC
+- Source: `https://www.edfmansugar.com/sugar-reports/`
+- Script: `python scripts/update_reports.py`
+
+The update script discovers published ED&F Man Monthly Sugar Note PDFs, downloads missing reports into `reports/`, runs the existing extraction pipeline for any uncached reports, and commits updated PDFs/JSON outputs back to `main`.
+
+To run successfully in GitHub Actions, add `OPENAI_API_KEY` as a repository secret.

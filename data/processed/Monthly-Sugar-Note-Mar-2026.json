@@ -3,7 +3,7 @@
   "source_path": "C:\\Users\\vinit\\OneDrive\\Desktop\\Assignments Sem 4\\Hartree AI Analyst\\sugar-dashboard\\reports\\Monthly-Sugar-Note-Mar-2026.pdf",
   "extraction": {
     "month": "Mar 2026",
-    "report_date": "2703-02-26",
+    "report_date": null,
     "ny11_front_month_price": 15.87,
     "ny11_price_change_pct": 15.0,
     "london5_front_month_price": null,

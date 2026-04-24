@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import math
+import re
 from datetime import datetime
 from pathlib import Path
 
@@ -22,6 +23,76 @@ def _cache_path_for_report(report_path: Path) -> Path:
     return PROCESSED_DIR / f"{report_path.stem}.json"
 
 
+def _infer_month_from_report_file(report_file: str) -> str | None:
+    month_aliases = {
+        "jan": "Jan",
+        "january": "Jan",
+        "feb": "Feb",
+        "february": "Feb",
+        "mar": "Mar",
+        "march": "Mar",
+        "apr": "Apr",
+        "april": "Apr",
+        "may": "May",
+        "jun": "Jun",
+        "june": "Jun",
+        "jul": "Jul",
+        "july": "Jul",
+        "aug": "Aug",
+        "august": "Aug",
+        "sep": "Sep",
+        "sept": "Sep",
+        "september": "Sep",
+        "oct": "Oct",
+        "october": "Oct",
+        "nov": "Nov",
+        "november": "Nov",
+        "dec": "Dec",
+        "december": "Dec",
+    }
+    match = re.search(
+        r"(jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t|tember)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)[-_ ]+(20\d{2})",
+        report_file,
+        flags=re.IGNORECASE,
+    )
+    if not match:
+        return None
+    month = month_aliases[match.group(1).lower()]
+    return f"{month} {match.group(2)}"
+
+
+def _month_label_is_valid(month: str | None) -> bool:
+    if not month:
+        return False
+    try:
+        parsed_month = datetime.strptime(month, "%b %Y")
+        if parsed_month.year < 2000 or parsed_month.year > 2100:
+            return False
+        return True
+    except ValueError:
+        return False
+
+
+def _clean_cached_payload(payload: dict) -> dict:
+    report_file = payload.get("report_file", "")
+    extraction_payload = payload.get("extraction", {})
+    if isinstance(extraction_payload, dict):
+        inferred_month = _infer_month_from_report_file(report_file)
+        if inferred_month and not _month_label_is_valid(extraction_payload.get("month")):
+            extraction_payload["month"] = inferred_month
+
+        report_date = extraction_payload.get("report_date")
+        if isinstance(report_date, str):
+            try:
+                parsed_date = datetime.fromisoformat(report_date).date()
+                if parsed_date.year < 2000 or parsed_date.year > 2100:
+                    extraction_payload["report_date"] = None
+            except ValueError:
+                extraction_payload["report_date"] = None
+
+    return payload
+
+
 def _compute_direction(current: float | None, previous: float | None) -> str | None:
     if current is None or previous is None:
         return None
@@ -32,9 +103,22 @@ def _compute_direction(current: float | None, previous: float | None) -> str | N
     return "Flat"
 
 
+def _reports_are_adjacent_months(current: ProcessedReport | None, previous: ProcessedReport | None) -> bool:
+    if current is None or previous is None:
+        return False
+    try:
+        current_month = datetime.strptime(current.extraction.month, "%b %Y")
+        previous_month = datetime.strptime(previous.extraction.month, "%b %Y")
+    except ValueError:
+        return False
+
+    month_delta = (current_month.year - previous_month.year) * 12 + current_month.month - previous_month.month
+    return month_delta == 1
+
+
 def _derive_metrics(current: ProcessedReport | None, previous: ProcessedReport | None) -> DerivedMetrics:
     current_extraction = current.extraction if current else None
-    previous_extraction = previous.extraction if previous else None
+    previous_extraction = previous.extraction if _reports_are_adjacent_months(current, previous) else None
 
     current_price = current_extraction.ny11_front_month_price if current_extraction else None
     previous_price = previous_extraction.ny11_front_month_price if previous_extraction else None
@@ -74,6 +158,7 @@ def _derive_metrics(current: ProcessedReport | None, previous: ProcessedReport |
 
 def _load_processed_report(cache_path: Path) -> ProcessedReport:
     payload = json.loads(cache_path.read_text(encoding="utf-8"))
+    payload = _clean_cached_payload(payload)
     payload.pop("month", None)
     extraction_payload = payload.get("extraction", {})
     if isinstance(extraction_payload, dict):
@@ -116,6 +201,11 @@ def load_reports(force_reextract: bool = False) -> list[ProcessedReport]:
 
         ingested = extract_pdf_pages(report_path)
         extraction = extractor.extract(ingested)
+        inferred_month = _infer_month_from_report_file(report_path.name)
+        if inferred_month and not _month_label_is_valid(extraction.month):
+            extraction.month = inferred_month
+        if extraction.report_date and (extraction.report_date.year < 2000 or extraction.report_date.year > 2100):
+            extraction.report_date = None
         report = ProcessedReport(
             report_file=report_path.name,
             source_path=str(report_path),
