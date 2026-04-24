@@ -358,8 +358,8 @@ def _render_report_rag_demo(reports: list) -> None:
             {
                 "Source": item.record.source_type,
                 "Title": item.record.title,
-                "Region": item.record.region,
-                "Period": item.record.period,
+                "Month": item.record.month,
+                "Page": item.record.page_number or "Summary",
                 "Retrieval score": item.retrieval_score,
                 "Rerank score": item.rerank_score,
                 "Matched terms": ", ".join(item.matched_terms),
