@@ -74,6 +74,7 @@ class PageIndexNode:
     summary: str
     report_file: str
     month: str
+    text: str = ""
     children: tuple["PageIndexNode", ...] = ()
 
     @property
@@ -409,8 +410,40 @@ def _page_summary(page_text: str, max_characters: int = 520) -> str:
     return _clean_text(page_text)[:max_characters]
 
 
+def _section_title(section_text: str, section_index: int) -> str:
+    first_sentence = re.split(r"(?<=[.!?])\s+", section_text.strip(), maxsplit=1)[0]
+    first_sentence = re.sub(r"^\d+\s+(?:©\s+)?ED&F MAN\s+\d{4}\s+Monthly Sugar Note\s+", "", first_sentence)
+    cleaned = re.sub(r"[^A-Za-z0-9 /&%$.-]+", " ", first_sentence)
+    words = cleaned.split()
+    if not words:
+        return f"Section {section_index}"
+    return " ".join(words[:10])
+
+
+def _build_section_nodes(report: ProcessedReport, report_index: int, page) -> tuple[PageIndexNode, ...]:
+    sections = _split_page_text(page.text, max_characters=900)
+    if not sections:
+        cleaned = _clean_text(page.text)
+        sections = [cleaned] if cleaned else []
+
+    return tuple(
+        PageIndexNode(
+            title=_section_title(section, section_index),
+            node_id=f"r{report_index:02d}.p{page.page_number:03d}.s{section_index:02d}",
+            start_page=page.page_number,
+            end_page=page.page_number,
+            summary=section[:520],
+            report_file=report.report_file,
+            month=report.month,
+            text=section,
+        )
+        for section_index, section in enumerate(sections, start=1)
+        if not _is_low_value_chunk(section)
+    )
+
+
 def build_page_index(reports: Iterable[ProcessedReport]) -> list[PageIndexNode]:
-    """Build a compact, PageIndex-style hierarchy from cached report pages."""
+    """Build a compact, PageIndex-style report > page > section hierarchy."""
     index: list[PageIndexNode] = []
     for report_index, report in enumerate(reports, start=1):
         page_nodes = tuple(
@@ -422,6 +455,8 @@ def build_page_index(reports: Iterable[ProcessedReport]) -> list[PageIndexNode]:
                 summary=_page_summary(page.text),
                 report_file=report.report_file,
                 month=report.month,
+                text=_clean_text(page.text),
+                children=_build_section_nodes(report, report_index, page),
             )
             for page in report.page_text
             if _clean_text(page.text)
@@ -456,11 +491,16 @@ def _format_page_index(nodes: Iterable[PageIndexNode], max_summary_characters: i
             f"- {report_node.node_id} | {report_node.month} | {report_node.title} | "
             f"{report_node.page_range_label} | {report_node.summary[:max_summary_characters]}"
         )
-        for child in report_node.children:
+        for page_node in report_node.children:
             lines.append(
-                f"  - {child.node_id} | {child.title} | {child.page_range_label} | "
-                f"{child.summary[:max_summary_characters]}"
+                f"  - {page_node.node_id} | {page_node.title} | {page_node.page_range_label} | "
+                f"{page_node.summary[:max_summary_characters]}"
             )
+            for section_node in page_node.children:
+                lines.append(
+                    f"    - {section_node.node_id} | {section_node.title} | "
+                    f"{section_node.page_range_label} | {section_node.summary[:max_summary_characters]}"
+                )
     return "\n".join(lines)
 
 
@@ -480,18 +520,19 @@ def _parse_json_object(value: str) -> dict:
 
 
 def _page_node_to_record(node: PageIndexNode, page_lookup: dict[tuple[str, int], str]) -> EvidenceRecord:
-    page_text = ""
-    if node.start_page is not None:
+    page_text = node.text
+    if not page_text and node.start_page is not None:
         page_text = page_lookup.get((node.report_file, node.start_page), "")
     text = _clean_text(page_text) or node.summary
+    source_type = "PageIndex section search" if ".s" in node.node_id else "PageIndex tree search"
     return EvidenceRecord(
         source_id=f"{node.report_file}:{node.node_id}",
-        source_type="PageIndex tree search",
+        source_type=source_type,
         title=node.title,
         month=node.month,
         page_number=node.start_page,
         text=text,
-        citation=f"{node.report_file}, {node.page_range_label}",
+        citation=f"{node.report_file}, {node.page_range_label}, {node.title}" if ".s" in node.node_id else f"{node.report_file}, {node.page_range_label}",
         weight=1.35,
     )
 
@@ -516,10 +557,10 @@ def _retrieve_pageindex_with_ai(
                     "role": "system",
                     "content": (
                         "You perform PageIndex-style retrieval over ED&F Man sugar reports. "
-                        "Use the tree index to choose the most relevant page nodes for the question. "
+                        "Use the tree index to choose the most relevant report section nodes for the question. "
                         "Return only JSON with keys can_answer, reasoning, and nodes. "
                         "nodes must be an array of objects with node_id, relevance from 0 to 1, and reason. "
-                        "Prefer precise page nodes over report root nodes."
+                        "Prefer precise section nodes ending in .sNN over page nodes; use page nodes only when no section is specific enough."
                     ),
                 },
                 {
@@ -559,7 +600,7 @@ def _retrieve_pageindex_with_ai(
                 retrieval_score=round(max(0.0, min(relevance, 1.0)), 3),
                 rerank_score=round(max(0.0, min(relevance, 1.0)) + 0.2, 3),
                 matched_terms=tuple(sorted(_tokens(question).intersection(_tokens(f"{node.title} {node.summary}")))),
-                search_path=f"{node.month} > {node.page_range_label}",
+                search_path=f"{node.month} > {node.page_range_label} > {node.title}" if ".s" in node.node_id else f"{node.month} > {node.page_range_label}",
                 reasoning=reason or str(payload.get("reasoning", "")).strip(),
             )
         )
@@ -587,7 +628,7 @@ def retrieve_pageindex_evidence(
     page_records = [
         _page_node_to_record(node, page_lookup)
         for node in _flatten_page_index(index_nodes)
-        if ".p" in node.node_id
+        if ".s" in node.node_id
     ]
     fallback = retrieve_evidence(question, page_records, top_k=top_k)
     return [
@@ -596,8 +637,8 @@ def retrieve_pageindex_evidence(
             retrieval_score=item.retrieval_score,
             rerank_score=item.rerank_score,
             matched_terms=item.matched_terms,
-            search_path=f"{item.record.month} > page {item.record.page_number}",
-            reasoning="Fallback lexical scoring over the PageIndex tree summaries.",
+            search_path=f"{item.record.month} > page {item.record.page_number} > {item.record.title}",
+            reasoning="Fallback lexical scoring over the PageIndex section summaries.",
         )
         for item in fallback
     ]
@@ -648,7 +689,7 @@ def _has_enough_support(question: str, evidence: list[RetrievedEvidence]) -> boo
     query_terms = _tokens(question)
     matched_terms = set(evidence[0].matched_terms)
     has_domain_match = bool(query_terms.intersection(DOMAIN_TERMS))
-    has_pageindex_support = evidence[0].record.source_type == "PageIndex tree search" and evidence[0].rerank_score >= 0.45
+    has_pageindex_support = evidence[0].record.source_type.startswith("PageIndex") and evidence[0].rerank_score >= 0.45
     has_structured_support = evidence[0].record.source_type == "Structured extraction" and bool(matched_terms)
     has_specific_support = len(matched_terms) >= 2 or evidence[0].rerank_score >= 0.35 or has_structured_support
     return has_pageindex_support or (has_domain_match and has_specific_support)
