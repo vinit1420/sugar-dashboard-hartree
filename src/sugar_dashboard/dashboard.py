@@ -382,49 +382,7 @@ def _render_evidence_panel(selected: pd.Series, show_raw_evidence: bool) -> None
             st.text(_text_value(selected["extracted_text_preview"], "No preview available."))
 
 
-def run_app() -> None:
-    st.set_page_config(
-        page_title="Global Sugar Market Insights Dashboard",
-        page_icon=":bar_chart:",
-        layout="wide",
-    )
-    _inject_styles()
-
-    st.markdown(
-        """
-        <div class="hero">
-            <h1>Global Sugar Market Insights Dashboard</h1>
-            <p>AI-assisted extraction and summarization of monthly sugar reports</p>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-
-    top_col1, top_col2, top_col3 = st.columns([1.4, 1, 1])
-    with top_col1:
-        st.caption("A lightweight internal commodity intelligence tool for Jan-Mar 2026 market dynamics.")
-
-    reports: list = []
-    force_reextract = False
-    with top_col2:
-        force_reextract = st.button("Re-extract reports", width="stretch")
-    with top_col3:
-        show_raw_evidence = st.toggle("Show raw evidence", value=False)
-
-    try:
-        reports = load_reports(force_reextract=force_reextract)
-    except Exception as exc:
-        st.error(f"Unable to load reports: {exc}")
-        st.stop()
-
-    frame = reports_to_dataframe(reports)
-    if frame.empty:
-        st.warning("No reports found in the reports directory.")
-        st.stop()
-
-    month_options = ["All"] + frame["month"].tolist()
-    selected_month = st.selectbox("Month selector", month_options, index=0)
-
+def _render_dashboard_page(frame: pd.DataFrame, selected_month: str, show_raw_evidence: bool) -> None:
     display_frame = frame if selected_month == "All" else frame[frame["month"] == selected_month]
     selected = display_frame.iloc[-1]
     latest = latest_row(frame)
@@ -471,6 +429,58 @@ def run_app() -> None:
     st.markdown("### Trade / Risk")
     _render_trade_section(selected)
 
+    _render_evidence_panel(selected, show_raw_evidence)
+
+
+def _render_ask_question_page(reports: list) -> None:
     _render_report_rag_demo(reports)
 
-    _render_evidence_panel(selected, show_raw_evidence)
+
+def run_app() -> None:
+    st.set_page_config(
+        page_title="Global Sugar Market Insights Dashboard",
+        page_icon=":bar_chart:",
+        layout="wide",
+    )
+    _inject_styles()
+
+    page = st.sidebar.radio("Page", ["Dashboard", "Ask a Question"], index=0)
+
+    st.markdown(
+        """
+        <div class="hero">
+            <h1>Global Sugar Market Insights</h1>
+            <p>AI-assisted extraction, dashboarding, and report Q&A for monthly sugar reports</p>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    top_col1, top_col2, top_col3 = st.columns([1.4, 1, 1])
+    with top_col1:
+        st.caption("A lightweight internal commodity intelligence tool for Jan-Mar 2026 market dynamics.")
+
+    reports: list = []
+    force_reextract = False
+    with top_col2:
+        force_reextract = st.button("Re-extract reports", width="stretch")
+    with top_col3:
+        show_raw_evidence = st.toggle("Show raw evidence", value=False)
+
+    try:
+        reports = load_reports(force_reextract=force_reextract)
+    except Exception as exc:
+        st.error(f"Unable to load reports: {exc}")
+        st.stop()
+
+    frame = reports_to_dataframe(reports)
+    if frame.empty:
+        st.warning("No reports found in the reports directory.")
+        st.stop()
+
+    if page == "Dashboard":
+        month_options = ["All"] + frame["month"].tolist()
+        selected_month = st.selectbox("Month selector", month_options, index=0)
+        _render_dashboard_page(frame, selected_month, show_raw_evidence)
+    else:
+        _render_ask_question_page(reports)
