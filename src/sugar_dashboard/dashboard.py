@@ -357,13 +357,15 @@ def _render_retrieval_tree(result: RagAnswer) -> None:
         st.markdown(f"- **{month}** · `{report_file}`")
         for item in items:
             page_label = f"page {item.record.page_number}" if item.record.page_number else "extracted summary"
+            section_label = item.record.title if item.record.source_type == "PageIndex section search" else page_label
             path = item.search_path or f"{month} > {page_label}"
             reason = item.reasoning or "Selected because it matched the question context."
             terms = ", ".join(item.matched_terms) if item.matched_terms else "tree reasoning"
             st.markdown(
                 "\n".join(
                     [
-                        f"  - **{page_label}**",
+                        f"  - **Section:** {section_label}",
+                        f"    - Page: {page_label}",
                         f"    - Path: `{path}`",
                         f"    - Why selected: {reason}",
                         f"    - Signal: {terms}",

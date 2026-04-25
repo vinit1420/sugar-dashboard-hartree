@@ -568,7 +568,7 @@ def _retrieve_pageindex_with_ai(
                     "content": (
                         f"Question: {question}\n\n"
                         f"Tree index:\n{_format_page_index(index_nodes)}\n\n"
-                        f"Select up to {top_k} relevant page nodes."
+                        f"Select up to {top_k} relevant section nodes ending in .sNN."
                     ),
                 },
             ],
@@ -587,7 +587,7 @@ def _retrieve_pageindex_with_ai(
             continue
         node_id = str(selected.get("node_id", "")).strip()
         node = node_by_id.get(node_id)
-        if node is None or not node.node_id.startswith("r") or ".p" not in node.node_id:
+        if node is None or not node.node_id.startswith("r") or ".s" not in node.node_id:
             continue
         try:
             relevance = float(selected.get("relevance", 0.0))
