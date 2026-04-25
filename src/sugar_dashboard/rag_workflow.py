@@ -4,10 +4,11 @@ import json
 import re
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Iterable
+from typing import Iterable, Literal
 
 from openai import OpenAI
 from openai import OpenAIError
+from pydantic import BaseModel, Field
 
 from sugar_dashboard.config import get_settings
 from sugar_dashboard.models import ProcessedReport
@@ -50,6 +51,18 @@ class RagAnswer:
     confidence: str
     evidence: list[RetrievedEvidence]
     can_answer: bool
+
+
+class QuestionIntent(BaseModel):
+    intent: Literal["near_term_price_estimate", "report_qa"] = Field(
+        description="Route the user question to a deterministic forecast estimate or normal report-grounded QA."
+    )
+    target_month: str | None = Field(
+        default=None,
+        description="Canonical target month like 'Apr 2026' when the user asks for a future estimate.",
+    )
+    confidence: float = Field(ge=0.0, le=1.0)
+    reasoning: str
 
 
 @dataclass(frozen=True)
@@ -220,6 +233,65 @@ def _parse_month_label(month: str) -> datetime | None:
 
 def _months_between(start: datetime, end: datetime) -> int:
     return (end.year - start.year) * 12 + end.month - start.month
+
+
+def _latest_report_month(reports: Iterable[ProcessedReport]) -> str | None:
+    sorted_reports = sorted(reports, key=lambda report: report.extraction.month_sort_key)
+    return sorted_reports[-1].month if sorted_reports else None
+
+
+def _classify_question_with_keywords(question: str) -> QuestionIntent:
+    intent = "near_term_price_estimate" if _is_price_estimate_question(question) else "report_qa"
+    return QuestionIntent(
+        intent=intent,
+        target_month=_month_from_question(question),
+        confidence=0.55 if intent == "near_term_price_estimate" else 0.4,
+        reasoning="Fallback keyword classifier used because the LLM classifier was unavailable.",
+    )
+
+
+def classify_question_intent(question: str, reports: Iterable[ProcessedReport]) -> QuestionIntent:
+    report_list = list(reports)
+    settings = get_settings()
+    if not settings.openai_api_key:
+        return _classify_question_with_keywords(question)
+
+    loaded_months = ", ".join(report.month for report in sorted(report_list, key=lambda item: item.extraction.month_sort_key))
+    latest_month = _latest_report_month(report_list) or "unknown"
+    try:
+        client = OpenAI(api_key=settings.openai_api_key)
+        response = client.responses.parse(
+            model=settings.openai_model,
+            input=[
+                {
+                    "role": "system",
+                    "content": (
+                        "Classify commodity dashboard questions for routing. "
+                        "Use near_term_price_estimate only when the user asks for an expected, forecast, projected, "
+                        "estimated, or forward-looking NY11/sugar price for a month after the latest loaded report. "
+                        "Use report_qa for questions asking what loaded reports say, why something happened, "
+                        "or any question that should be answered from document evidence. "
+                        "If the user uses a relative target like next month, resolve it relative to the latest loaded report month. "
+                        "Return the target_month in 'Mon YYYY' format when intent is near_term_price_estimate."
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": (
+                        f"Question: {question}\n"
+                        f"Loaded report months: {loaded_months}\n"
+                        f"Latest loaded report month: {latest_month}"
+                    ),
+                },
+            ],
+            text_format=QuestionIntent,
+        )
+        if response.output_parsed is not None:
+            return response.output_parsed
+    except OpenAIError:
+        pass
+
+    return _classify_question_with_keywords(question)
 
 
 def _clean_text(value: str) -> str:
@@ -594,8 +666,12 @@ def _is_price_estimate_question(question: str) -> bool:
     return has_price_term and has_estimate_term and _month_from_question(question) is not None
 
 
-def _answer_price_estimate_question(question: str, reports: Iterable[ProcessedReport]) -> RagAnswer | None:
-    target_month = _month_from_question(question)
+def _answer_price_estimate_question(
+    question: str,
+    reports: Iterable[ProcessedReport],
+    target_month: str | None = None,
+) -> RagAnswer | None:
+    target_month = target_month or _month_from_question(question)
     target_date = _parse_month_label(target_month) if target_month else None
     if target_date is None:
         return None
@@ -813,8 +889,9 @@ def _generate_ai_answer(question: str, evidence: list[RetrievedEvidence]) -> str
 
 def answer_report_question(question: str, reports: Iterable[ProcessedReport]) -> RagAnswer:
     report_list = list(reports)
-    if _is_price_estimate_question(question):
-        estimate_answer = _answer_price_estimate_question(question, report_list)
+    question_intent = classify_question_intent(question, report_list)
+    if question_intent.intent == "near_term_price_estimate":
+        estimate_answer = _answer_price_estimate_question(question, report_list, question_intent.target_month)
         if estimate_answer is not None:
             return estimate_answer
 
