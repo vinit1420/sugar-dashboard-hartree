@@ -335,9 +335,7 @@ def _render_report_rag_demo(reports: list) -> None:
     answer_tab, evidence_tab = st.tabs(["Answer", "Evidence"])
 
     with answer_tab:
-        _section_card("Question", result.question)
         _section_card("Answer", result.answer.replace("\n", "<br>"))
-        _section_card("Confidence", result.confidence)
 
     with evidence_tab:
         evidence_rows = [
