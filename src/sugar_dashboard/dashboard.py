@@ -315,7 +315,7 @@ def _render_trade_section(selected: pd.Series) -> None:
 def _render_report_rag_demo(reports: list) -> None:
     st.markdown("### Report Q&A")
     st.caption(
-        "Ask grounded questions across the loaded ED&F Man sugar reports. If the reports do not support an answer, the assistant will say so."
+        "Ask grounded questions across the loaded ED&F Man sugar reports. Retrieval uses a PageIndex-style report/page tree before reading source text."
     )
 
     st.markdown("**Suggestions**")
@@ -347,6 +347,8 @@ def _render_report_rag_demo(reports: list) -> None:
                 "Retrieval score": item.retrieval_score,
                 "Rerank score": item.rerank_score,
                 "Matched terms": ", ".join(item.matched_terms),
+                "Search path": item.search_path,
+                "Reasoning": item.reasoning,
                 "Citation": item.record.citation,
             }
             for item in result.evidence

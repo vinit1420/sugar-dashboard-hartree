@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import re
 from dataclasses import dataclass
 from typing import Iterable
@@ -37,6 +38,8 @@ class RetrievedEvidence:
     retrieval_score: float
     rerank_score: float
     matched_terms: tuple[str, ...]
+    search_path: str = ""
+    reasoning: str = ""
 
 
 @dataclass(frozen=True)
@@ -46,6 +49,26 @@ class RagAnswer:
     confidence: str
     evidence: list[RetrievedEvidence]
     can_answer: bool
+
+
+@dataclass(frozen=True)
+class PageIndexNode:
+    title: str
+    node_id: str
+    start_page: int | None
+    end_page: int | None
+    summary: str
+    report_file: str
+    month: str
+    children: tuple["PageIndexNode", ...] = ()
+
+    @property
+    def page_range_label(self) -> str:
+        if self.start_page is None:
+            return "summary"
+        if self.end_page is None or self.end_page == self.start_page:
+            return f"page {self.start_page}"
+        return f"pages {self.start_page}-{self.end_page}"
 
 
 STOP_WORDS = {
@@ -288,6 +311,214 @@ def build_report_evidence(reports: Iterable[ProcessedReport]) -> list[EvidenceRe
     return records
 
 
+def _report_summary(report: ProcessedReport) -> str:
+    summaries = _structured_summary_records(report)
+    if summaries:
+        return summaries[0].text
+    return _clean_text(report.extracted_text_preview)[:1200]
+
+
+def _page_summary(page_text: str, max_characters: int = 520) -> str:
+    chunks = _split_page_text(page_text, max_characters=max_characters)
+    if chunks:
+        return chunks[0][:max_characters]
+    return _clean_text(page_text)[:max_characters]
+
+
+def build_page_index(reports: Iterable[ProcessedReport]) -> list[PageIndexNode]:
+    """Build a compact, PageIndex-style hierarchy from cached report pages."""
+    index: list[PageIndexNode] = []
+    for report_index, report in enumerate(reports, start=1):
+        page_nodes = tuple(
+            PageIndexNode(
+                title=f"{report.month} report page {page.page_number}",
+                node_id=f"r{report_index:02d}.p{page.page_number:03d}",
+                start_page=page.page_number,
+                end_page=page.page_number,
+                summary=_page_summary(page.text),
+                report_file=report.report_file,
+                month=report.month,
+            )
+            for page in report.page_text
+            if _clean_text(page.text)
+        )
+        index.append(
+            PageIndexNode(
+                title=f"{report.month} - {report.report_file}",
+                node_id=f"r{report_index:02d}",
+                start_page=page_nodes[0].start_page if page_nodes else None,
+                end_page=page_nodes[-1].end_page if page_nodes else None,
+                summary=_report_summary(report),
+                report_file=report.report_file,
+                month=report.month,
+                children=page_nodes,
+            )
+        )
+    return index
+
+
+def _flatten_page_index(nodes: Iterable[PageIndexNode]) -> list[PageIndexNode]:
+    flattened: list[PageIndexNode] = []
+    for node in nodes:
+        flattened.append(node)
+        flattened.extend(_flatten_page_index(node.children))
+    return flattened
+
+
+def _format_page_index(nodes: Iterable[PageIndexNode], max_summary_characters: int = 420) -> str:
+    lines: list[str] = []
+    for report_node in nodes:
+        lines.append(
+            f"- {report_node.node_id} | {report_node.month} | {report_node.title} | "
+            f"{report_node.page_range_label} | {report_node.summary[:max_summary_characters]}"
+        )
+        for child in report_node.children:
+            lines.append(
+                f"  - {child.node_id} | {child.title} | {child.page_range_label} | "
+                f"{child.summary[:max_summary_characters]}"
+            )
+    return "\n".join(lines)
+
+
+def _parse_json_object(value: str) -> dict:
+    cleaned = value.strip()
+    if cleaned.startswith("```"):
+        cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"\s*```$", "", cleaned)
+    match = re.search(r"\{.*\}", cleaned, flags=re.DOTALL)
+    if match:
+        cleaned = match.group(0)
+    try:
+        parsed = json.loads(cleaned)
+        return parsed if isinstance(parsed, dict) else {}
+    except json.JSONDecodeError:
+        return {}
+
+
+def _page_node_to_record(node: PageIndexNode, page_lookup: dict[tuple[str, int], str]) -> EvidenceRecord:
+    page_text = ""
+    if node.start_page is not None:
+        page_text = page_lookup.get((node.report_file, node.start_page), "")
+    text = _clean_text(page_text) or node.summary
+    return EvidenceRecord(
+        source_id=f"{node.report_file}:{node.node_id}",
+        source_type="PageIndex tree search",
+        title=node.title,
+        month=node.month,
+        page_number=node.start_page,
+        text=text,
+        citation=f"{node.report_file}, {node.page_range_label}",
+        weight=1.35,
+    )
+
+
+def _retrieve_pageindex_with_ai(
+    question: str,
+    index_nodes: list[PageIndexNode],
+    page_lookup: dict[tuple[str, int], str],
+    top_k: int,
+) -> list[RetrievedEvidence]:
+    settings = get_settings()
+    if not settings.openai_api_key:
+        return []
+
+    node_by_id = {node.node_id: node for node in _flatten_page_index(index_nodes)}
+    try:
+        client = OpenAI(api_key=settings.openai_api_key)
+        response = client.responses.create(
+            model=settings.openai_model,
+            input=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You perform PageIndex-style retrieval over ED&F Man sugar reports. "
+                        "Use the tree index to choose the most relevant page nodes for the question. "
+                        "Return only JSON with keys can_answer, reasoning, and nodes. "
+                        "nodes must be an array of objects with node_id, relevance from 0 to 1, and reason. "
+                        "Prefer precise page nodes over report root nodes."
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": (
+                        f"Question: {question}\n\n"
+                        f"Tree index:\n{_format_page_index(index_nodes)}\n\n"
+                        f"Select up to {top_k} relevant page nodes."
+                    ),
+                },
+            ],
+        )
+    except OpenAIError:
+        return []
+
+    payload = _parse_json_object(response.output_text)
+    selected_nodes = payload.get("nodes", [])
+    if not isinstance(selected_nodes, list):
+        return []
+
+    retrieved: list[RetrievedEvidence] = []
+    for selected in selected_nodes:
+        if not isinstance(selected, dict):
+            continue
+        node_id = str(selected.get("node_id", "")).strip()
+        node = node_by_id.get(node_id)
+        if node is None or not node.node_id.startswith("r") or ".p" not in node.node_id:
+            continue
+        try:
+            relevance = float(selected.get("relevance", 0.0))
+        except (TypeError, ValueError):
+            relevance = 0.0
+        reason = str(selected.get("reason", "")).strip()
+        retrieved.append(
+            RetrievedEvidence(
+                record=_page_node_to_record(node, page_lookup),
+                retrieval_score=round(max(0.0, min(relevance, 1.0)), 3),
+                rerank_score=round(max(0.0, min(relevance, 1.0)) + 0.2, 3),
+                matched_terms=tuple(sorted(_tokens(question).intersection(_tokens(f"{node.title} {node.summary}")))),
+                search_path=f"{node.month} > {node.page_range_label}",
+                reasoning=reason or str(payload.get("reasoning", "")).strip(),
+            )
+        )
+
+    return sorted(retrieved, key=lambda item: item.rerank_score, reverse=True)[:top_k]
+
+
+def retrieve_pageindex_evidence(
+    question: str,
+    reports: Iterable[ProcessedReport],
+    top_k: int = 6,
+) -> list[RetrievedEvidence]:
+    scoped_reports = list(reports)
+    index_nodes = build_page_index(scoped_reports)
+    page_lookup = {
+        (report.report_file, page.page_number): page.text
+        for report in scoped_reports
+        for page in report.page_text
+    }
+
+    ai_evidence = _retrieve_pageindex_with_ai(question, index_nodes, page_lookup, top_k=top_k)
+    if ai_evidence:
+        return ai_evidence
+
+    page_records = [
+        _page_node_to_record(node, page_lookup)
+        for node in _flatten_page_index(index_nodes)
+        if ".p" in node.node_id
+    ]
+    fallback = retrieve_evidence(question, page_records, top_k=top_k)
+    return [
+        RetrievedEvidence(
+            record=item.record,
+            retrieval_score=item.retrieval_score,
+            rerank_score=item.rerank_score,
+            matched_terms=item.matched_terms,
+            search_path=f"{item.record.month} > page {item.record.page_number}",
+            reasoning="Fallback lexical scoring over the PageIndex tree summaries.",
+        )
+        for item in fallback
+    ]
+
+
 def retrieve_evidence(
     question: str,
     records: Iterable[EvidenceRecord],
@@ -333,9 +564,10 @@ def _has_enough_support(question: str, evidence: list[RetrievedEvidence]) -> boo
     query_terms = _tokens(question)
     matched_terms = set(evidence[0].matched_terms)
     has_domain_match = bool(query_terms.intersection(DOMAIN_TERMS))
+    has_pageindex_support = evidence[0].record.source_type == "PageIndex tree search" and evidence[0].rerank_score >= 0.45
     has_structured_support = evidence[0].record.source_type == "Structured extraction" and bool(matched_terms)
     has_specific_support = len(matched_terms) >= 2 or evidence[0].rerank_score >= 0.35 or has_structured_support
-    return has_domain_match and has_specific_support
+    return has_pageindex_support or (has_domain_match and has_specific_support)
 
 
 def _is_brazil_supply_question(question: str) -> bool:
@@ -434,6 +666,8 @@ def _build_evidence_context(evidence: list[RetrievedEvidence], max_items: int = 
                 [
                     f"Evidence {index}",
                     f"Citation: {item.record.citation}",
+                    f"Search path: {item.search_path}" if item.search_path else "",
+                    f"Retrieval reasoning: {item.reasoning}" if item.reasoning else "",
                     f"Text: {text[:1200]}",
                 ]
             )
@@ -479,8 +713,7 @@ def answer_report_question(question: str, reports: Iterable[ProcessedReport]) ->
     if _is_brazil_supply_question(question):
         return _answer_brazil_supply_question(question, scoped_reports)
 
-    records = build_report_evidence(scoped_reports)
-    evidence = retrieve_evidence(question, records)
+    evidence = retrieve_pageindex_evidence(question, scoped_reports)
 
     if not _has_enough_support(question, evidence):
         return RagAnswer(
