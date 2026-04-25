@@ -457,8 +457,6 @@ def run_app() -> None:
     )
 
     top_col1, top_col2, top_col3 = st.columns([1.4, 1, 1])
-    with top_col1:
-        st.caption("A lightweight internal commodity intelligence tool for Jan-Mar 2026 market dynamics.")
 
     reports: list = []
     force_reextract = False
