@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+from collections import defaultdict
 from typing import Any
 
 import altair as alt
@@ -9,7 +10,7 @@ import pandas as pd
 import streamlit as st
 
 from sugar_dashboard.pipeline import latest_row, load_reports, reports_to_dataframe
-from sugar_dashboard.rag_workflow import SUGGESTED_QUESTIONS, answer_report_question
+from sugar_dashboard.rag_workflow import SUGGESTED_QUESTIONS, RagAnswer, answer_report_question
 
 
 def _inject_styles() -> None:
@@ -338,30 +339,38 @@ def _render_report_rag_demo(reports: list) -> None:
         _section_card("Answer", result.answer.replace("\n", "<br>"))
 
     with evidence_tab:
-        evidence_rows = [
-            {
-                "Source": item.record.source_type,
-                "Title": item.record.title,
-                "Month": item.record.month,
-                "Page": item.record.page_number or "Summary",
-                "Retrieval score": item.retrieval_score,
-                "Rerank score": item.rerank_score,
-                "Matched terms": ", ".join(item.matched_terms),
-                "Search path": item.search_path,
-                "Reasoning": item.reasoning,
-                "Citation": item.record.citation,
-            }
-            for item in result.evidence
-        ]
-        if evidence_rows:
-            st.dataframe(evidence_rows, width="stretch", hide_index=True)
-        else:
-            st.info("No report evidence was retrieved for this question.")
+        _render_retrieval_tree(result)
 
-        for item in result.evidence:
-            with st.expander(f"{item.record.source_type}: {item.record.title}"):
-                st.write(item.record.text)
-                st.caption(item.record.citation)
+
+def _render_retrieval_tree(result: RagAnswer) -> None:
+    if not result.evidence:
+        st.info("No report evidence was retrieved for this question.")
+        return
+
+    grouped_evidence: dict[tuple[str, str], list] = defaultdict(list)
+    for item in result.evidence:
+        report_file = item.record.citation.split(",", 1)[0]
+        grouped_evidence[(item.record.month, report_file)].append(item)
+
+    st.markdown("**Retrieval tree**")
+    for (month, report_file), items in grouped_evidence.items():
+        st.markdown(f"- **{month}** · `{report_file}`")
+        for item in items:
+            page_label = f"page {item.record.page_number}" if item.record.page_number else "extracted summary"
+            path = item.search_path or f"{month} > {page_label}"
+            reason = item.reasoning or "Selected because it matched the question context."
+            terms = ", ".join(item.matched_terms) if item.matched_terms else "tree reasoning"
+            st.markdown(
+                "\n".join(
+                    [
+                        f"  - **{page_label}**",
+                        f"    - Path: `{path}`",
+                        f"    - Why selected: {reason}",
+                        f"    - Signal: {terms}",
+                        f"    - Citation: {item.record.citation}",
+                    ]
+                )
+            )
 
 
 def _render_evidence_panel(selected: pd.Series, show_raw_evidence: bool) -> None:
