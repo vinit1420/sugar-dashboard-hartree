@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Iterable
 
 from openai import OpenAI
@@ -208,6 +209,17 @@ def _reports_for_question(question: str, reports: Iterable[ProcessedReport]) -> 
         return sorted_reports[-1:]
 
     return sorted_reports
+
+
+def _parse_month_label(month: str) -> datetime | None:
+    try:
+        return datetime.strptime(month, "%b %Y")
+    except ValueError:
+        return None
+
+
+def _months_between(start: datetime, end: datetime) -> int:
+    return (end.year - start.year) * 12 + end.month - start.month
 
 
 def _clean_text(value: str) -> str:
@@ -575,6 +587,97 @@ def _is_brazil_supply_question(question: str) -> bool:
     return "brazil" in terms and bool(terms.intersection({"supply", "production", "crop", "cane", "crush"}))
 
 
+def _is_price_estimate_question(question: str) -> bool:
+    terms = _tokens(question)
+    has_price_term = bool(terms.intersection({"price", "prices", "ny11"}))
+    has_estimate_term = bool(terms.intersection({"estimate", "expected", "forecast", "outlook", "projection"}))
+    return has_price_term and has_estimate_term and _month_from_question(question) is not None
+
+
+def _answer_price_estimate_question(question: str, reports: Iterable[ProcessedReport]) -> RagAnswer | None:
+    target_month = _month_from_question(question)
+    target_date = _parse_month_label(target_month) if target_month else None
+    if target_date is None:
+        return None
+
+    price_points = [
+        (report, _parse_month_label(report.month), report.extraction.ny11_front_month_price)
+        for report in sorted(reports, key=lambda item: item.extraction.month_sort_key)
+    ]
+    price_points = [
+        (report, parsed_month, price)
+        for report, parsed_month, price in price_points
+        if parsed_month is not None and price is not None
+    ]
+    if len(price_points) < 2:
+        return None
+
+    latest_report, latest_month, latest_price = price_points[-1]
+    if latest_month is None or latest_price is None:
+        return None
+
+    month_gap = _months_between(latest_month, target_date)
+    if month_gap < 1 or month_gap > 3:
+        return None
+
+    prices = [price for _, _, price in price_points]
+    deltas = [current - previous for previous, current in zip(prices, prices[1:])]
+    recent_deltas = deltas[-3:] if len(deltas) >= 3 else deltas
+    average_recent_delta = sum(recent_deltas) / len(recent_deltas)
+    momentum_adjustment = average_recent_delta * month_gap
+    point_estimate = round(latest_price + momentum_adjustment, 2)
+
+    absolute_moves = [abs(delta) for delta in recent_deltas]
+    average_move = sum(absolute_moves) / len(absolute_moves)
+    half_range = max(0.45, average_move * 0.75)
+    low_estimate = round(point_estimate - half_range, 2)
+    high_estimate = round(point_estimate + half_range, 2)
+
+    evidence_text = "; ".join(
+        f"{report.month}: NY11 {price:.2f} c/lb"
+        for report, _, price in price_points[-6:]
+        if price is not None
+    )
+    evidence_record = EvidenceRecord(
+        source_id=f"{latest_report.report_file}:ny11-trend-estimate",
+        source_type="Trend estimate",
+        title="Extracted NY11 price trend",
+        month=latest_report.month,
+        page_number=None,
+        text=evidence_text,
+        citation="Cached structured extraction, NY11 front-month price trend",
+        weight=1.0,
+    )
+    evidence = [
+        RetrievedEvidence(
+            record=evidence_record,
+            retrieval_score=1.0,
+            rerank_score=1.0,
+            matched_terms=tuple(sorted(_tokens(question).intersection({"price", "ny11", "estimate", "expected"}))),
+            search_path=f"Structured prices > latest NY11 trend > {target_month} estimate",
+            reasoning=(
+                f"Used the latest extracted NY11 price ({latest_price:.2f} c/lb in {latest_report.month}) "
+                f"and recent month-to-month momentum ({average_recent_delta:+.2f} c/lb/month)."
+            ),
+        )
+    ]
+
+    return RagAnswer(
+        question=question,
+        answer=(
+            f"A simple trend-based estimate for NY11 in {target_month} is about {point_estimate:.2f} c/lb, "
+            f"with a rough range of {low_estimate:.2f}-{high_estimate:.2f} c/lb. "
+            f"This is an extrapolation from extracted report prices, not a reported April value or trading advice."
+        ),
+        confidence=(
+            "Estimated from cached NY11 front-month prices because no loaded April 2026 report is available. "
+            "Use as a directional dashboard estimate, not a market forecast."
+        ),
+        evidence=evidence,
+        can_answer=True,
+    )
+
+
 def _find_brazil_supply_evidence(reports: Iterable[ProcessedReport]) -> list[RetrievedEvidence]:
     records = build_report_evidence(reports)
     wanted_phrases = (
@@ -709,7 +812,13 @@ def _generate_ai_answer(question: str, evidence: list[RetrievedEvidence]) -> str
 
 
 def answer_report_question(question: str, reports: Iterable[ProcessedReport]) -> RagAnswer:
-    scoped_reports = _reports_for_question(question, reports)
+    report_list = list(reports)
+    if _is_price_estimate_question(question):
+        estimate_answer = _answer_price_estimate_question(question, report_list)
+        if estimate_answer is not None:
+            return estimate_answer
+
+    scoped_reports = _reports_for_question(question, report_list)
     if _is_brazil_supply_question(question):
         return _answer_brazil_supply_question(question, scoped_reports)
 
