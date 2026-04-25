@@ -4,6 +4,10 @@ import re
 from dataclasses import dataclass
 from typing import Iterable
 
+from openai import OpenAI
+from openai import OpenAIError
+
+from sugar_dashboard.config import get_settings
 from sugar_dashboard.models import ProcessedReport
 
 
@@ -394,23 +398,10 @@ def _answer_brazil_supply_question(question: str, reports: Iterable[ProcessedRep
             can_answer=False,
         )
 
-    answer = (
-        "Brazil's supply story became less comfortable in the latest reports. "
-        "January and February still showed a largely completed Center-South crop around 600-602 mmt of cane "
-        "and roughly 40.2 mmt of sugar, but they also flagged lower ATR, a lower early-season sugar mix, and "
-        "ethanol as the key swing factor.\n\n"
-        "By March, the issue sharpened: the cane-crush estimate was raised to 626 mmt, but projected sugar "
-        "production fell by 1.9 mmt to 38.9 mmt because lower ATR and a more ethanol-oriented production mix "
-        "offset the larger cane number. Higher oil prices, low ethanol stocks, and stronger hydrous ethanol "
-        "demand make mills more likely to favor ethanol over sugar.\n\n"
-        "Bottom line: Brazil is not simply a bigger-cane bearish story. The risk is that energy-driven ethanol "
-        "economics reduce the sugar mix and tighten sugar availability despite a healthy cane outlook."
-    )
-
     return RagAnswer(
         question=question,
-        answer=answer,
-        confidence="High: synthesized from the Brazil C/S sections and Brazil-focused evidence in the latest reports.",
+        answer=_generate_ai_answer(question, evidence),
+        confidence="AI-generated from Brazil C/S evidence in the latest reports. Review the Evidence tab for source text and citations.",
         evidence=evidence,
         can_answer=True,
     )
@@ -430,6 +421,57 @@ def _make_answer(question: str, evidence: list[RetrievedEvidence]) -> str:
         "Short answer: the reports point to the following supported takeaways:\n\n"
         + "\n".join(cited_points)
     )
+
+
+def _build_evidence_context(evidence: list[RetrievedEvidence], max_items: int = 5) -> str:
+    context_parts = []
+    for index, item in enumerate(evidence[:max_items], start=1):
+        text = item.record.text
+        if "Monthly Sugar Note " in text[:80]:
+            text = text.split("Monthly Sugar Note ", 1)[1]
+        context_parts.append(
+            "\n".join(
+                [
+                    f"Evidence {index}",
+                    f"Citation: {item.record.citation}",
+                    f"Text: {text[:1200]}",
+                ]
+            )
+        )
+    return "\n\n".join(context_parts)
+
+
+def _generate_ai_answer(question: str, evidence: list[RetrievedEvidence]) -> str:
+    settings = get_settings()
+    if not settings.openai_api_key:
+        return _make_answer(question, evidence)
+
+    try:
+        client = OpenAI(api_key=settings.openai_api_key)
+        response = client.responses.create(
+            model=settings.openai_model,
+            input=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You are a commodity market analyst. Answer using only the supplied ED&F Man report evidence. "
+                        "Write 2 concise sentences. Be direct and synthesize the finding; do not list evidence bullets. "
+                        "If the evidence is insufficient, say you cannot answer from the loaded reports."
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": (
+                        f"Question: {question}\n\n"
+                        f"Evidence:\n{_build_evidence_context(evidence)}\n\n"
+                        "Answer in 2 concise sentences."
+                    ),
+                },
+            ],
+        )
+        return response.output_text.strip()
+    except OpenAIError:
+        return _make_answer(question, evidence)
 
 
 def answer_report_question(question: str, reports: Iterable[ProcessedReport]) -> RagAnswer:
@@ -454,8 +496,8 @@ def answer_report_question(question: str, reports: Iterable[ProcessedReport]) ->
 
     return RagAnswer(
         question=question,
-        answer=_make_answer(question, evidence),
-        confidence="Grounded in the top retrieved report snippets. Review the Evidence tab for source text and citations.",
+        answer=_generate_ai_answer(question, evidence),
+        confidence="AI-generated from the top retrieved report evidence. Review the Evidence tab for source text and citations.",
         evidence=evidence,
         can_answer=True,
     )
