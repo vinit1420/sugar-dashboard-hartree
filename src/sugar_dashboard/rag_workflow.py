@@ -534,7 +534,7 @@ def _is_heading_block(block: LayoutBlock, median_font_size: float) -> bool:
         "imports",
         "exports",
     )
-    if len(words) <= 8 and any(term in lowered for term in known_heading_terms):
+    if len(words) <= 8 and text[:1].isupper() and any(term in lowered for term in known_heading_terms):
         return True
     if len(text) <= 90 and block.max_font_size >= median_font_size + 1.2:
         return True
@@ -556,7 +556,7 @@ def _layout_sections(report: ProcessedReport, page) -> list[tuple[str, str]]:
         nonlocal current_title, current_parts
         section_text = _clean_text(" ".join(current_parts))
         if not _is_low_value_chunk(section_text):
-            title = current_title or _section_title(section_text, len(sections) + 1)
+            title = current_title or f"Section {len(sections) + 1}"
             sections.append((title, section_text))
         current_title = ""
         current_parts = []
@@ -578,7 +578,7 @@ def _text_sections(page) -> list[tuple[str, str]]:
     if not sections:
         cleaned = _clean_text(page.text)
         sections = [cleaned] if cleaned else []
-    return [(_section_title(section, index), section) for index, section in enumerate(sections, start=1)]
+    return [(f"Section {index}", section) for index, section in enumerate(sections, start=1)]
 
 
 def _build_section_nodes(report: ProcessedReport, report_index: int, page) -> tuple[PageIndexNode, ...]:
@@ -586,7 +586,7 @@ def _build_section_nodes(report: ProcessedReport, report_index: int, page) -> tu
 
     return tuple(
         PageIndexNode(
-            title=title,
+            title=title if not title.startswith("Section ") else f"Page {page.page_number} {title}",
             node_id=f"r{report_index:02d}.p{page.page_number:03d}.s{section_index:02d}",
             start_page=page.page_number,
             end_page=page.page_number,
