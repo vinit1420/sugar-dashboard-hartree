@@ -22,6 +22,40 @@ SUGGESTED_QUESTIONS = [
 ]
 
 
+MONTH_ALIASES = {
+    "jan": "Jan",
+    "january": "Jan",
+    "feb": "Feb",
+    "february": "Feb",
+    "mar": "Mar",
+    "march": "Mar",
+    "apr": "Apr",
+    "april": "Apr",
+    "may": "May",
+    "jun": "Jun",
+    "june": "Jun",
+    "jul": "Jul",
+    "july": "Jul",
+    "aug": "Aug",
+    "august": "Aug",
+    "sep": "Sep",
+    "sept": "Sep",
+    "september": "Sep",
+    "oct": "Oct",
+    "october": "Oct",
+    "nov": "Nov",
+    "november": "Nov",
+    "dec": "Dec",
+    "december": "Dec",
+}
+
+
+MONTH_PATTERN = (
+    r"jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|"
+    r"aug(?:ust)?|sep(?:t|tember)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?"
+)
+
+
 @dataclass(frozen=True)
 class EvidenceRecord:
     source_id: str
@@ -185,77 +219,20 @@ def _tokens(value: str) -> set[str]:
 
 
 def _month_from_question(question: str) -> str | None:
-    month_aliases = {
-        "jan": "Jan",
-        "january": "Jan",
-        "feb": "Feb",
-        "february": "Feb",
-        "mar": "Mar",
-        "march": "Mar",
-        "apr": "Apr",
-        "april": "Apr",
-        "may": "May",
-        "jun": "Jun",
-        "june": "Jun",
-        "jul": "Jul",
-        "july": "Jul",
-        "aug": "Aug",
-        "august": "Aug",
-        "sep": "Sep",
-        "sept": "Sep",
-        "september": "Sep",
-        "oct": "Oct",
-        "october": "Oct",
-        "nov": "Nov",
-        "november": "Nov",
-        "dec": "Dec",
-        "december": "Dec",
-    }
-    match = re.search(
-        r"\b(jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t|tember)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\s+(20\d{2})\b",
-        question,
-        flags=re.IGNORECASE,
-    )
-    if not match:
-        return None
-    return f"{month_aliases[match.group(1).lower()]} {match.group(2)}"
+    months = _months_from_question(question)
+    return months[0] if months else None
 
 
 def _months_from_question(question: str) -> list[str]:
-    month_aliases = {
-        "jan": "Jan",
-        "january": "Jan",
-        "feb": "Feb",
-        "february": "Feb",
-        "mar": "Mar",
-        "march": "Mar",
-        "apr": "Apr",
-        "april": "Apr",
-        "may": "May",
-        "jun": "Jun",
-        "june": "Jun",
-        "jul": "Jul",
-        "july": "Jul",
-        "aug": "Aug",
-        "august": "Aug",
-        "sep": "Sep",
-        "sept": "Sep",
-        "september": "Sep",
-        "oct": "Oct",
-        "october": "Oct",
-        "nov": "Nov",
-        "november": "Nov",
-        "dec": "Dec",
-        "december": "Dec",
-    }
-    matches = re.findall(
-        r"\b(jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t|tember)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\s+(20\d{2})\b",
-        question,
-        flags=re.IGNORECASE,
-    )
+    month_mentions = list(re.finditer(rf"\b({MONTH_PATTERN})(?:\s+(20\d{{2}}))?\b", question, flags=re.IGNORECASE))
+    explicit_years = [match.group(2) for match in month_mentions if match.group(2)]
+    inferred_year = explicit_years[-1] if explicit_years else None
     months: list[str] = []
-    for month, year in matches:
-        label = f"{month_aliases[month.lower()]} {year}"
+    for match in month_mentions:
+        year = match.group(2) or inferred_year
+        if not year:
+            continue
+        label = f"{MONTH_ALIASES[match.group(1).lower()]} {year}"
         if label not in months:
             months.append(label)
     return months
@@ -288,9 +265,14 @@ def _reports_for_question(question: str, reports: Iterable[ProcessedReport]) -> 
         return []
 
     lowered = question.lower()
-    target_month = _month_from_question(question)
-    if target_month:
-        return [report for report in sorted_reports if report.month == target_month]
+    target_months = _months_from_question(question)
+    is_cross_month = len(target_months) > 1 or any(term in lowered for term in ("compare", "across", "from", "between", "evolve", "changed"))
+    if target_months:
+        if is_cross_month:
+            scoped = _reports_for_comparison(target_months, sorted_reports)
+            if scoped:
+                return scoped
+        return [report for report in sorted_reports if report.month == target_months[0]]
 
     if "latest reports" in lowered or "recent reports" in lowered:
         return sorted_reports[-3:]
@@ -325,7 +307,14 @@ def _classify_question_with_keywords(question: str) -> QuestionIntent:
         intent = "price_estimate"
     elif any(phrase in lowered for phrase in ("how does this dashboard", "how is this dashboard", "what does this dashboard", "how are the values", "how is pydantic", "what is pydantic")):
         intent = "dashboard_help"
-    elif "available reports" in lowered or "loaded reports" in lowered or "latest price" in lowered or "latest ny11" in lowered or "compare" in terms:
+    elif (
+        "available reports" in lowered
+        or "loaded reports" in lowered
+        or "latest price" in lowered
+        or "latest ny11" in lowered
+        or ("compare" in terms and "india" in terms and bool(terms.intersection({"export", "exports", "outlook"})))
+        or ("compare" in terms and bool(terms.intersection({"ny11", "price", "prices", "brent", "oil", "cane", "crush", "production", "mix"})))
+    ):
         intent = "data_lookup"
     elif terms.intersection({"define", "definition", "mean", "means"}) or any(
         phrase in lowered
@@ -371,7 +360,9 @@ def classify_question_intent(question: str, reports: Iterable[ProcessedReport]) 
                         "Use price_estimate only when the user asks for an expected, forecast, projected, "
                         "estimated, or forward-looking NY11/sugar price for a month after the latest loaded report. "
                         "Use data_lookup when the user asks for a specific dashboard value, latest loaded data, loaded reports, "
-                        "comparisons across months, or a direct value available in the structured report fields. "
+                        "or a direct numeric/text value available in the structured report fields. "
+                        "Use data_lookup for comparisons when the metric is a structured dashboard value like NY11, Brent, cane crush, production, sugar mix, or India export outlook. "
+                        "Use report_qa for qualitative comparisons such as broad risks, market tone, or why something changed. "
                         "Use dashboard_help when the user asks how the app, dashboard, extraction, RAG, evidence, or implementation works. "
                         "Use general_domain_help for stable commodity-market definitions or concept explanations that do not need report evidence. "
                         "Use out_of_scope for questions unrelated to sugar markets, commodity reports, or this dashboard. "
@@ -849,6 +840,7 @@ def retrieve_pageindex_evidence(
 ) -> list[RetrievedEvidence]:
     scoped_reports = list(reports)
     index_nodes = build_page_index(scoped_reports)
+    per_month_limit = max(1, min(top_k, 2))
     page_lookup = {
         (report.report_file, page.page_number): page.text
         for report in scoped_reports
@@ -857,7 +849,7 @@ def retrieve_pageindex_evidence(
 
     ai_evidence = _retrieve_pageindex_with_ai(question, index_nodes, page_lookup, top_k=top_k)
     if ai_evidence:
-        return ai_evidence
+        return _ensure_month_coverage(ai_evidence, index_nodes, page_lookup, per_month_limit=per_month_limit, top_k=top_k)
 
     page_records = [
         _page_node_to_record(node, page_lookup)
@@ -865,7 +857,7 @@ def retrieve_pageindex_evidence(
         if ".s" in node.node_id
     ]
     fallback = retrieve_evidence(question, page_records, top_k=top_k)
-    return [
+    fallback_evidence = [
         RetrievedEvidence(
             record=item.record,
             retrieval_score=item.retrieval_score,
@@ -876,6 +868,50 @@ def retrieve_pageindex_evidence(
         )
         for item in fallback
     ]
+    return _ensure_month_coverage(fallback_evidence, index_nodes, page_lookup, per_month_limit=per_month_limit, top_k=top_k)
+
+
+def _ensure_month_coverage(
+    evidence: list[RetrievedEvidence],
+    index_nodes: list[PageIndexNode],
+    page_lookup: dict[tuple[str, int], str],
+    per_month_limit: int,
+    top_k: int,
+) -> list[RetrievedEvidence]:
+    if len(index_nodes) <= 1:
+        return evidence[:top_k]
+
+    evidence_by_month: dict[str, list[RetrievedEvidence]] = {}
+    for item in evidence:
+        evidence_by_month.setdefault(item.record.month, []).append(item)
+
+    covered: list[RetrievedEvidence] = []
+    existing_source_ids = {item.record.source_id for item in evidence}
+    for report_node in index_nodes:
+        month_items = evidence_by_month.get(report_node.month, [])
+        if month_items:
+            covered.extend(month_items[:per_month_limit])
+            continue
+
+        section_nodes = [node for node in _flatten_page_index([report_node]) if ".s" in node.node_id]
+        for node in section_nodes[:per_month_limit]:
+            record = _page_node_to_record(node, page_lookup)
+            if record.source_id in existing_source_ids:
+                continue
+            existing_source_ids.add(record.source_id)
+            covered.append(
+                RetrievedEvidence(
+                    record=record,
+                    retrieval_score=0.5,
+                    rerank_score=0.5,
+                    matched_terms=(),
+                    search_path=f"{node.month} > {node.page_range_label} > {node.title}",
+                    reasoning="Included to ensure each requested report month is represented in the cross-report comparison.",
+                )
+            )
+
+    covered.extend(item for item in evidence if item.record.source_id not in {covered_item.record.source_id for covered_item in covered})
+    return covered[:top_k]
 
 
 def retrieve_evidence(
@@ -1071,6 +1107,40 @@ def _reports_for_comparison(requested_months: list[str], reports: list[Processed
 
 
 def _answer_comparison_lookup_question(question: str, selected_reports: list[ProcessedReport]) -> RagAnswer:
+    terms = _tokens(question)
+    if "india" in terms and bool(terms.intersection({"export", "exports", "outlook"})):
+        points = []
+        for report in selected_reports:
+            note = report.extraction.india_exports_note or report.extraction.india_note or report.extraction.trade_summary
+            points.append((report.month, report.report_file, note or "No India export note extracted."))
+
+        answer = "India export outlook by month: " + " ".join(f"{month}: {note}" for month, _, note in points)
+        record = EvidenceRecord(
+            source_id="structured-data:india-export-comparison",
+            source_type="Structured data lookup",
+            title="India export outlook comparison",
+            month=f"{points[0][0]} to {points[-1][0]}",
+            page_number=None,
+            text="; ".join(f"{month}: {note}" for month, _, note in points),
+            citation="Cached structured extraction, India export outlook fields",
+        )
+        return RagAnswer(
+            question=question,
+            answer=answer,
+            confidence="Answered from cached structured India export fields across the requested month range.",
+            evidence=[
+                RetrievedEvidence(
+                    record=record,
+                    retrieval_score=1.0,
+                    rerank_score=1.0,
+                    matched_terms=tuple(sorted(_tokens(question).intersection(_tokens(answer)))),
+                    search_path=f"Structured data > India export outlook comparison > {points[0][0]} to {points[-1][0]}",
+                    reasoning="The classifier routed this as a structured India export comparison, so matching month rows were compared.",
+                )
+            ],
+            can_answer=True,
+        )
+
     price_points = [
         (report.month, report.report_file, report.extraction.ny11_front_month_price)
         for report in selected_reports
