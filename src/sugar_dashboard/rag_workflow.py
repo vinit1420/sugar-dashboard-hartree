@@ -54,12 +54,19 @@ class RagAnswer:
 
 
 class QuestionIntent(BaseModel):
-    intent: Literal["near_term_price_estimate", "report_qa"] = Field(
-        description="Route the user question to a deterministic forecast estimate or normal report-grounded QA."
+    intent: Literal[
+        "report_qa",
+        "price_estimate",
+        "dashboard_help",
+        "general_domain_help",
+        "out_of_scope",
+        "data_lookup",
+    ] = Field(
+        description="Route the user question to the correct dashboard answer workflow."
     )
     target_month: str | None = Field(
         default=None,
-        description="Canonical target month like 'Apr 2026' when the user asks for a future estimate.",
+        description="Canonical target month like 'Apr 2026' when the user asks for a month-specific answer.",
     )
     confidence: float = Field(ge=0.0, le=1.0)
     reasoning: str
@@ -271,11 +278,35 @@ def _latest_report_month(reports: Iterable[ProcessedReport]) -> str | None:
 
 
 def _classify_question_with_keywords(question: str) -> QuestionIntent:
-    intent = "near_term_price_estimate" if _is_price_estimate_question(question) else "report_qa"
+    terms = _tokens(question)
+    lowered = question.lower()
+
+    if _is_price_estimate_question(question):
+        intent = "price_estimate"
+    elif any(phrase in lowered for phrase in ("how does this dashboard", "how is this dashboard", "what does this dashboard", "how are the values", "how is pydantic", "what is pydantic")):
+        intent = "dashboard_help"
+    elif "available reports" in lowered or "loaded reports" in lowered or "latest price" in lowered or "latest ny11" in lowered:
+        intent = "data_lookup"
+    elif terms.intersection({"define", "definition", "mean", "means"}) or any(
+        phrase in lowered
+        for phrase in (
+            "what is ny11",
+            "what's ny11",
+            "what is cane crush",
+            "what is ethanol",
+            "what does c/lb",
+        )
+    ):
+        intent = "general_domain_help"
+    elif not terms.intersection(DOMAIN_TERMS.union({"dashboard", "report", "reports", "price", "estimate", "expected"})):
+        intent = "out_of_scope"
+    else:
+        intent = "report_qa"
+
     return QuestionIntent(
         intent=intent,
         target_month=_month_from_question(question),
-        confidence=0.55 if intent == "near_term_price_estimate" else 0.4,
+        confidence=0.55,
         reasoning="Fallback keyword classifier used because the LLM classifier was unavailable.",
     )
 
@@ -297,12 +328,17 @@ def classify_question_intent(question: str, reports: Iterable[ProcessedReport]) 
                     "role": "system",
                     "content": (
                         "Classify commodity dashboard questions for routing. "
-                        "Use near_term_price_estimate only when the user asks for an expected, forecast, projected, "
+                        "Use price_estimate only when the user asks for an expected, forecast, projected, "
                         "estimated, or forward-looking NY11/sugar price for a month after the latest loaded report. "
+                        "Use data_lookup when the user asks for a specific dashboard value, latest loaded data, loaded reports, "
+                        "or a direct value available in the structured report fields. "
+                        "Use dashboard_help when the user asks how the app, dashboard, extraction, RAG, evidence, or implementation works. "
+                        "Use general_domain_help for stable commodity-market definitions or concept explanations that do not need report evidence. "
+                        "Use out_of_scope for questions unrelated to sugar markets, commodity reports, or this dashboard. "
                         "Use report_qa for questions asking what loaded reports say, why something happened, "
                         "or any question that should be answered from document evidence. "
                         "If the user uses a relative target like next month, resolve it relative to the latest loaded report month. "
-                        "Return the target_month in 'Mon YYYY' format when intent is near_term_price_estimate."
+                        "Return the target_month in 'Mon YYYY' format when one is relevant."
                     ),
                 },
                 {
@@ -871,6 +907,182 @@ def _is_price_estimate_question(question: str) -> bool:
     return has_price_term and has_estimate_term and _month_from_question(question) is not None
 
 
+def _simple_answer(
+    question: str,
+    answer: str,
+    confidence: str,
+    source_type: str,
+    citation: str,
+    can_answer: bool = True,
+) -> RagAnswer:
+    record = EvidenceRecord(
+        source_id=f"{source_type.lower().replace(' ', '-')}:answer",
+        source_type=source_type,
+        title=source_type,
+        month="N/A",
+        page_number=None,
+        text=answer,
+        citation=citation,
+    )
+    evidence = [
+        RetrievedEvidence(
+            record=record,
+            retrieval_score=1.0,
+            rerank_score=1.0,
+            matched_terms=tuple(sorted(_tokens(question).intersection(_tokens(answer)))),
+            search_path=source_type,
+            reasoning=confidence,
+        )
+    ]
+    return RagAnswer(question=question, answer=answer, confidence=confidence, evidence=evidence, can_answer=can_answer)
+
+
+def _answer_dashboard_help_question(question: str) -> RagAnswer:
+    lowered = question.lower()
+    if "rag" in lowered or "evidence" in lowered or "pageindex" in lowered:
+        answer = (
+            "The Ask a Question page uses an intent classifier, then a PageIndex-style report > page > section tree to retrieve relevant report sections before generating an answer. "
+            "The Dashboard page itself does not use RAG; it renders cached structured extraction fields from the reports."
+        )
+    elif "pydantic" in lowered:
+        answer = (
+            "Pydantic defines the typed schemas for extracted report fields, cached processed reports, dashboard rows, and the question intent classifier. "
+            "It validates LLM structured outputs and cached JSON before the dashboard uses them."
+        )
+    elif "values" in lowered or "dashboard" in lowered:
+        answer = (
+            "Dashboard values come from PyMuPDF text extraction, OpenAI structured extraction into Pydantic schemas, cached JSON files, and a Pandas dataframe rendered with Streamlit and Altair. "
+            "KPI cards, supply drivers, and trade/risk panels read fields from that validated dataframe."
+        )
+    else:
+        answer = (
+            "The app has two main flows: the Dashboard renders cached structured report data, while Ask a Question uses intent routing plus section-level retrieval for report-grounded answers. "
+            "Use Show raw evidence on the dashboard to inspect extracted JSON and snippets."
+        )
+
+    return _simple_answer(
+        question=question,
+        answer=answer,
+        confidence="Answered from the dashboard implementation overview; no report retrieval was needed.",
+        source_type="Dashboard help",
+        citation="Application workflow",
+    )
+
+
+def _answer_general_domain_question(question: str) -> RagAnswer:
+    lowered = question.lower()
+    if "ny11" in lowered:
+        answer = "NY11 usually refers to ICE raw sugar futures, a benchmark contract for world raw sugar prices quoted in cents per pound."
+    elif "c/lb" in lowered or "cent" in lowered:
+        answer = "c/lb means cents per pound, the common quotation unit for raw sugar futures such as NY11."
+    elif "cane crush" in lowered or "crush" in lowered:
+        answer = "Cane crush is the volume of sugarcane processed by mills; it is a key supply indicator because it drives sugar and ethanol output."
+    elif "ethanol" in lowered:
+        answer = "Ethanol matters for sugar because cane mills can shift some cane toward ethanol or sugar depending on relative prices, especially in Brazil."
+    else:
+        answer = (
+            "I can explain stable sugar-market concepts such as NY11, cane crush, sugar mix, ethanol parity, imports, exports, and trade risks. "
+            "For report-specific claims, ask a report-grounded question and I will retrieve the relevant section evidence."
+        )
+
+    return _simple_answer(
+        question=question,
+        answer=answer,
+        confidence="Answered as general sugar-market background; no report retrieval was needed.",
+        source_type="General domain help",
+        citation="General commodity-market knowledge",
+    )
+
+
+def _answer_out_of_scope_question(question: str) -> RagAnswer:
+    return _simple_answer(
+        question=question,
+        answer=(
+            "I can only answer questions about the loaded sugar reports, the dashboard data, sugar-market concepts, or near-term NY11 estimates. "
+            "Try asking about NY11, Brazil supply, India exports, Thailand production, oil/ethanol, trade risks, or how the dashboard works."
+        ),
+        confidence="No answer: the classifier routed this as outside the dashboard scope.",
+        source_type="Out of scope",
+        citation="Question intent router",
+        can_answer=False,
+    )
+
+
+def _format_price(value: float | None) -> str:
+    return "N/A" if value is None else f"{value:.2f} c/lb"
+
+
+def _answer_data_lookup_question(question: str, reports: Iterable[ProcessedReport]) -> RagAnswer | None:
+    report_list = sorted(reports, key=lambda item: item.extraction.month_sort_key)
+    if not report_list:
+        return None
+
+    target_month = _month_from_question(question)
+    selected_reports = [report for report in report_list if report.month == target_month] if target_month else [report_list[-1]]
+    if not selected_reports:
+        return None
+    report = selected_reports[-1]
+    extraction = report.extraction
+    lowered = question.lower()
+
+    if "available reports" in lowered or "loaded reports" in lowered:
+        answer = "Loaded reports: " + ", ".join(f"{item.month} ({item.report_file})" for item in report_list) + "."
+    elif "brent" in lowered or "oil" in lowered:
+        answer = f"{report.month} Brent oil is {extraction.brent_oil if extraction.brent_oil is not None else 'N/A'} $/bbl in the cached structured extraction."
+    elif "brazil" in lowered:
+        answer = (
+            f"For {report.month}, Brazil cane crush is {extraction.brazil_cane_crush_mmt or 'N/A'} mmt, "
+            f"sugar production is {extraction.brazil_sugar_production_mmt or 'N/A'} mmt, and sugar mix is {extraction.brazil_sugar_mix_pct or 'N/A'}%."
+        )
+    elif "india" in lowered:
+        answer = (
+            f"For {report.month}, India current production is {extraction.india_current_production_mmt or 'N/A'} mmt, "
+            f"final outlook is {extraction.india_final_outlook_mmt or 'N/A'} mmt, and exports note: {extraction.india_exports_note or 'N/A'}."
+        )
+    elif "thailand" in lowered:
+        answer = (
+            f"For {report.month}, Thailand production outlook is {extraction.thailand_production_outlook_mmt or 'N/A'} mmt "
+            f"and ethanol diversion is {extraction.thailand_ethanol_diversion_kmt or 'N/A'} kmt."
+        )
+    elif "trade" in lowered or "risk" in lowered or "disruption" in lowered:
+        answer = (
+            f"For {report.month}, major trade disruption is {extraction.major_trade_disruption or 'None highlighted'}, "
+            f"and trade summary is: {extraction.trade_summary or 'N/A'}."
+        )
+    elif "key driver" in lowered or "driver" in lowered:
+        answer = f"For {report.month}, the extracted key driver is: {extraction.key_driver or 'N/A'}."
+    elif "regime" in lowered:
+        answer = f"For {report.month}, the extracted market regime is: {extraction.market_regime or 'N/A'}."
+    else:
+        answer = f"For {report.month}, NY11 front-month price is {_format_price(extraction.ny11_front_month_price)}."
+
+    record = EvidenceRecord(
+        source_id=f"{report.report_file}:structured-data-lookup",
+        source_type="Structured data lookup",
+        title="Cached structured extraction",
+        month=report.month,
+        page_number=None,
+        text=answer,
+        citation=f"{report.report_file}, cached structured extraction",
+    )
+    return RagAnswer(
+        question=question,
+        answer=answer,
+        confidence="Answered from cached structured dashboard fields; no section retrieval was needed.",
+        evidence=[
+            RetrievedEvidence(
+                record=record,
+                retrieval_score=1.0,
+                rerank_score=1.0,
+                matched_terms=tuple(sorted(_tokens(question).intersection(_tokens(answer)))),
+                search_path=f"Structured data > {report.month}",
+                reasoning="The classifier routed this as a direct dashboard data lookup.",
+            )
+        ],
+        can_answer=True,
+    )
+
+
 def _answer_price_estimate_question(
     question: str,
     reports: Iterable[ProcessedReport],
@@ -1095,10 +1307,20 @@ def _generate_ai_answer(question: str, evidence: list[RetrievedEvidence]) -> str
 def answer_report_question(question: str, reports: Iterable[ProcessedReport]) -> RagAnswer:
     report_list = list(reports)
     question_intent = classify_question_intent(question, report_list)
-    if question_intent.intent == "near_term_price_estimate":
+    if question_intent.intent == "price_estimate":
         estimate_answer = _answer_price_estimate_question(question, report_list, question_intent.target_month)
         if estimate_answer is not None:
             return estimate_answer
+    if question_intent.intent == "dashboard_help":
+        return _answer_dashboard_help_question(question)
+    if question_intent.intent == "general_domain_help":
+        return _answer_general_domain_question(question)
+    if question_intent.intent == "out_of_scope":
+        return _answer_out_of_scope_question(question)
+    if question_intent.intent == "data_lookup":
+        lookup_answer = _answer_data_lookup_question(question, report_list)
+        if lookup_answer is not None:
+            return lookup_answer
 
     scoped_reports = _reports_for_question(question, report_list)
     if _is_brazil_supply_question(question):
