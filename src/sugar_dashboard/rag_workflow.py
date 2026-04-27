@@ -86,6 +86,14 @@ class PageIndexNode:
         return f"pages {self.start_page}-{self.end_page}"
 
 
+@dataclass(frozen=True)
+class LayoutBlock:
+    text: str
+    bbox: tuple[float, float, float, float]
+    max_font_size: float
+    is_bold: bool
+
+
 STOP_WORDS = {
     "a",
     "about",
@@ -204,6 +212,27 @@ def _month_from_question(question: str) -> str | None:
     if not match:
         return None
     return f"{month_aliases[match.group(1).lower()]} {match.group(2)}"
+
+
+def _month_scoring_terms(month: str) -> set[str]:
+    aliases = {
+        "Jan": {"jan", "january"},
+        "Feb": {"feb", "february"},
+        "Mar": {"mar", "march"},
+        "Apr": {"apr", "april"},
+        "May": {"may"},
+        "Jun": {"jun", "june"},
+        "Jul": {"jul", "july"},
+        "Aug": {"aug", "august"},
+        "Sep": {"sep", "sept", "september"},
+        "Oct": {"oct", "october"},
+        "Nov": {"nov", "november"},
+        "Dec": {"dec", "december"},
+    }
+    parts = month.split()
+    if len(parts) != 2:
+        return _tokens(month)
+    return aliases.get(parts[0], {parts[0].lower()}) | {parts[1]}
 
 
 def _reports_for_question(question: str, reports: Iterable[ProcessedReport]) -> list[ProcessedReport]:
@@ -413,6 +442,12 @@ def _page_summary(page_text: str, max_characters: int = 520) -> str:
 def _section_title(section_text: str, section_index: int) -> str:
     first_sentence = re.split(r"(?<=[.!?])\s+", section_text.strip(), maxsplit=1)[0]
     first_sentence = re.sub(r"^\d+\s+(?:©\s+)?ED&F MAN\s+\d{4}\s+Monthly Sugar Note\s+", "", first_sentence)
+    first_sentence = re.sub(
+        r"^\d{1,2}\s+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Sept|Oct|Nov|Dec)[a-z]*\s+\d{4}\s+",
+        "",
+        first_sentence,
+        flags=re.IGNORECASE,
+    )
     cleaned = re.sub(r"[^A-Za-z0-9 /&%$.-]+", " ", first_sentence)
     words = cleaned.split()
     if not words:
@@ -420,25 +455,148 @@ def _section_title(section_text: str, section_index: int) -> str:
     return " ".join(words[:10])
 
 
-def _build_section_nodes(report: ProcessedReport, report_index: int, page) -> tuple[PageIndexNode, ...]:
+def _extract_layout_blocks(report: ProcessedReport, page_number: int) -> list[LayoutBlock]:
+    try:
+        import fitz
+    except ImportError:
+        return []
+
+    try:
+        with fitz.open(report.source_path) as document:
+            page = document[page_number - 1]
+            payload = page.get_text("dict")
+    except Exception:
+        return []
+
+    blocks: list[LayoutBlock] = []
+    for block in payload.get("blocks", []):
+        if block.get("type") != 0:
+            continue
+
+        parts: list[str] = []
+        max_font_size = 0.0
+        is_bold = False
+        for line in block.get("lines", []):
+            line_parts = []
+            for span in line.get("spans", []):
+                text = str(span.get("text", "")).strip()
+                if not text:
+                    continue
+                line_parts.append(text)
+                max_font_size = max(max_font_size, float(span.get("size", 0.0) or 0.0))
+                font_name = str(span.get("font", "")).lower()
+                is_bold = is_bold or "bold" in font_name
+            if line_parts:
+                parts.append(" ".join(line_parts))
+
+        text = _clean_text(" ".join(parts))
+        if not text or "disclaimer:" in text.lower() or "this report does not constitute" in text.lower():
+            continue
+        bbox = tuple(float(value) for value in block.get("bbox", (0, 0, 0, 0)))
+        if len(bbox) != 4:
+            bbox = (0.0, 0.0, 0.0, 0.0)
+        blocks.append(LayoutBlock(text=text, bbox=bbox, max_font_size=max_font_size, is_bold=is_bold))
+
+    return sorted(blocks, key=lambda item: (round(item.bbox[1] / 12) * 12, item.bbox[0]))
+
+
+def _is_report_chrome(value: str) -> bool:
+    lowered = value.lower()
+    return (
+        lowered.isdigit()
+        or "monthly sugar note" in lowered and len(value) < 80
+        or lowered.startswith("© ed&f man")
+        or lowered.startswith("ed&f man")
+    )
+
+
+def _is_heading_block(block: LayoutBlock, median_font_size: float) -> bool:
+    text = block.text.strip()
+    lowered = text.lower()
+    words = text.split()
+    if re.match(r"^\d{1,2}\s+(jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)", lowered):
+        return False
+    known_heading_terms = (
+        "markets",
+        "focus",
+        "brazil",
+        "india",
+        "thailand",
+        "trade",
+        "risk",
+        "macro",
+        "price",
+        "ethanol",
+        "oil",
+        "freight",
+        "specs",
+        "funds",
+        "imports",
+        "exports",
+    )
+    if len(words) <= 8 and any(term in lowered for term in known_heading_terms):
+        return True
+    if len(text) <= 90 and block.max_font_size >= median_font_size + 1.2:
+        return True
+    return len(text) <= 70 and block.is_bold and len(words) <= 10
+
+
+def _layout_sections(report: ProcessedReport, page) -> list[tuple[str, str]]:
+    blocks = [block for block in _extract_layout_blocks(report, page.page_number) if not _is_report_chrome(block.text)]
+    if not blocks:
+        return []
+
+    font_sizes = sorted(block.max_font_size for block in blocks if block.max_font_size > 0)
+    median_font_size = font_sizes[len(font_sizes) // 2] if font_sizes else 0.0
+    sections: list[tuple[str, str]] = []
+    current_title = ""
+    current_parts: list[str] = []
+
+    def flush_section() -> None:
+        nonlocal current_title, current_parts
+        section_text = _clean_text(" ".join(current_parts))
+        if not _is_low_value_chunk(section_text):
+            title = current_title or _section_title(section_text, len(sections) + 1)
+            sections.append((title, section_text))
+        current_title = ""
+        current_parts = []
+
+    for block in blocks:
+        if _is_heading_block(block, median_font_size):
+            flush_section()
+            current_title = _section_title(block.text, len(sections) + 1)
+            current_parts = [block.text]
+            continue
+        current_parts.append(block.text)
+
+    flush_section()
+    return sections
+
+
+def _text_sections(page) -> list[tuple[str, str]]:
     sections = _split_page_text(page.text, max_characters=900)
     if not sections:
         cleaned = _clean_text(page.text)
         sections = [cleaned] if cleaned else []
+    return [(_section_title(section, index), section) for index, section in enumerate(sections, start=1)]
+
+
+def _build_section_nodes(report: ProcessedReport, report_index: int, page) -> tuple[PageIndexNode, ...]:
+    sections = _layout_sections(report, page) or _text_sections(page)
 
     return tuple(
         PageIndexNode(
-            title=_section_title(section, section_index),
+            title=title,
             node_id=f"r{report_index:02d}.p{page.page_number:03d}.s{section_index:02d}",
             start_page=page.page_number,
             end_page=page.page_number,
-            summary=section[:520],
+            summary=section_text[:520],
             report_file=report.report_file,
             month=report.month,
-            text=section,
+            text=section_text,
         )
-        for section_index, section in enumerate(sections, start=1)
-        if not _is_low_value_chunk(section)
+        for section_index, (title, section_text) in enumerate(sections, start=1)
+        if not _is_low_value_chunk(section_text)
     )
 
 
@@ -654,19 +812,25 @@ def retrieve_evidence(
         return []
 
     target_month = _month_from_question(question)
+    scoring_terms = set(query_terms)
+    if target_month:
+        scoring_terms -= _month_scoring_terms(target_month)
+    if not scoring_terms:
+        scoring_terms = set(query_terms)
+
     retrieved: list[RetrievedEvidence] = []
     for record in records:
         if target_month and record.month != target_month:
             continue
 
         record_terms = _tokens(" ".join([record.source_type, record.title, record.month, record.text]))
-        matched_terms = tuple(sorted(query_terms.intersection(record_terms)))
+        matched_terms = tuple(sorted(scoring_terms.intersection(record_terms)))
         if not matched_terms:
             continue
 
-        retrieval_score = len(matched_terms) / max(len(query_terms), 1)
-        domain_boost = 0.12 if query_terms.intersection(DOMAIN_TERMS).intersection(record_terms) else 0.0
-        month_boost = 0.08 if any(term in record.month.lower() for term in query_terms) else 0.0
+        retrieval_score = len(matched_terms) / max(len(scoring_terms), 1)
+        domain_boost = 0.12 if scoring_terms.intersection(DOMAIN_TERMS).intersection(record_terms) else 0.0
+        month_boost = 0.08 if target_month and record.month == target_month else 0.0
         structured_boost = 0.08 if record.source_type == "Structured extraction" else 0.0
         rerank_score = round((retrieval_score * record.weight) + domain_boost + month_boost + structured_boost, 3)
 
