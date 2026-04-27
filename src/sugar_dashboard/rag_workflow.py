@@ -106,6 +106,15 @@ class QuestionIntent(BaseModel):
     reasoning: str
 
 
+class AnswerQualityCheck(BaseModel):
+    passes: bool
+    directly_answers_question: bool
+    evidence_supports_answer: bool
+    is_too_vague: bool
+    missing_points: list[str] = Field(default_factory=list)
+    critique: str
+
+
 @dataclass(frozen=True)
 class PageIndexNode:
     title: str
@@ -1461,7 +1470,11 @@ def _build_evidence_context(evidence: list[RetrievedEvidence], max_items: int = 
     return "\n\n".join(context_parts)
 
 
-def _generate_ai_answer(question: str, evidence: list[RetrievedEvidence]) -> str:
+def _generate_ai_answer(
+    question: str,
+    evidence: list[RetrievedEvidence],
+    corrective_feedback: str | None = None,
+) -> str:
     settings = get_settings()
     if not settings.openai_api_key:
         return _make_answer(question, evidence)
@@ -1475,7 +1488,7 @@ def _generate_ai_answer(question: str, evidence: list[RetrievedEvidence]) -> str
                     "role": "system",
                     "content": (
                         "You are a commodity market analyst. Answer using only the supplied ED&F Man report evidence. "
-                        "Write 2 concise sentences. Be direct and synthesize the finding; do not list evidence bullets. "
+                        "Be direct and synthesize the finding. For compare/across/evolve questions, explicitly cover each requested month or period. "
                         "If the evidence is insufficient, say you cannot answer from the loaded reports."
                     ),
                 },
@@ -1484,7 +1497,8 @@ def _generate_ai_answer(question: str, evidence: list[RetrievedEvidence]) -> str
                     "content": (
                         f"Question: {question}\n\n"
                         f"Evidence:\n{_build_evidence_context(evidence)}\n\n"
-                        "Answer in 2 concise sentences."
+                        f"{f'Corrective feedback to address: {corrective_feedback}\\n\\n' if corrective_feedback else ''}"
+                        "Answer in 2-4 concise sentences. Mention the key evidence path or month-specific evidence when it matters."
                     ),
                 },
             ],
@@ -1492,6 +1506,89 @@ def _generate_ai_answer(question: str, evidence: list[RetrievedEvidence]) -> str
         return response.output_text.strip()
     except OpenAIError:
         return _make_answer(question, evidence)
+
+
+def _heuristic_quality_check(question: str, answer: str, evidence: list[RetrievedEvidence]) -> AnswerQualityCheck:
+    question_terms = _tokens(question)
+    answer_terms = _tokens(answer)
+    requested_months = _months_from_question(question)
+    compare_question = bool(question_terms.intersection({"compare", "across", "between", "evolve", "changed"})) or len(requested_months) > 1
+    missing_months = [month for month in requested_months if month.lower() not in answer.lower()] if compare_question else []
+    vague_markers = ("appears", "may", "could", "uncertain", "potential", "conditions improve", "coming months")
+    is_too_vague = compare_question and (len(answer) < 160 or any(marker in answer.lower() for marker in vague_markers))
+    evidence_months = {item.record.month for item in evidence}
+    missing_evidence_months = [
+        month for month in requested_months if month not in evidence_months and not any(month in item.record.month for item in evidence)
+    ] if compare_question else []
+    directly_answers = bool(question_terms.intersection(answer_terms)) and not missing_months
+    evidence_supports = bool(evidence) and not missing_evidence_months
+    missing_points = missing_months + [f"Evidence for {month}" for month in missing_evidence_months]
+    passes = directly_answers and evidence_supports and not is_too_vague
+    return AnswerQualityCheck(
+        passes=passes,
+        directly_answers_question=directly_answers,
+        evidence_supports_answer=evidence_supports,
+        is_too_vague=is_too_vague,
+        missing_points=missing_points,
+        critique="Heuristic quality check used because the LLM critic was unavailable.",
+    )
+
+
+def _check_answer_quality(question: str, answer: str, evidence: list[RetrievedEvidence]) -> AnswerQualityCheck:
+    settings = get_settings()
+    if not settings.openai_api_key:
+        return _heuristic_quality_check(question, answer, evidence)
+
+    try:
+        client = OpenAI(api_key=settings.openai_api_key)
+        response = client.responses.parse(
+            model=settings.openai_model,
+            input=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You are a corrective RAG quality critic for a sugar-market dashboard. "
+                        "Check whether the answer directly answers the question, is specific rather than vague, "
+                        "and is supported by the supplied evidence paths/text. "
+                        "For compare/across questions, require the answer and evidence to cover each requested month or period. "
+                        "Do not grade style; grade correctness, specificity, and evidence support."
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": (
+                        f"Question: {question}\n\n"
+                        f"Draft answer:\n{answer}\n\n"
+                        f"Evidence:\n{_build_evidence_context(evidence, max_items=8)}"
+                    ),
+                },
+            ],
+            text_format=AnswerQualityCheck,
+        )
+        if response.output_parsed is not None:
+            return response.output_parsed
+    except OpenAIError:
+        pass
+
+    return _heuristic_quality_check(question, answer, evidence)
+
+
+def _make_quality_failure_answer(
+    question: str,
+    evidence: list[RetrievedEvidence],
+    quality: AnswerQualityCheck,
+) -> RagAnswer:
+    missing = "; ".join(quality.missing_points) if quality.missing_points else quality.critique
+    return RagAnswer(
+        question=question,
+        answer=(
+            "I found evidence, but the generated answer did not pass the quality check. "
+            f"Missing or weak points: {missing}. Try narrowing the question or asking for a specific month/driver."
+        ),
+        confidence=f"Corrective RAG blocked the answer: {quality.critique}",
+        evidence=evidence,
+        can_answer=False,
+    )
 
 
 def answer_report_question(question: str, reports: Iterable[ProcessedReport]) -> RagAnswer:
@@ -1530,10 +1627,26 @@ def answer_report_question(question: str, reports: Iterable[ProcessedReport]) ->
             can_answer=False,
         )
 
+    answer = _generate_ai_answer(question, evidence)
+    quality = _check_answer_quality(question, answer, evidence)
+    if not quality.passes:
+        corrective_feedback = (
+            f"Critique: {quality.critique}. Missing points: {', '.join(quality.missing_points) or 'none listed'}. "
+            "Revise to directly answer the question using only supplied evidence. "
+            "If this is a comparison, cover each requested month/period explicitly."
+        )
+        answer = _generate_ai_answer(question, evidence, corrective_feedback=corrective_feedback)
+        quality = _check_answer_quality(question, answer, evidence)
+        if not quality.passes:
+            return _make_quality_failure_answer(question, evidence, quality)
+
     return RagAnswer(
         question=question,
-        answer=_generate_ai_answer(question, evidence),
-        confidence="AI-generated from the top retrieved report evidence. Review the Evidence tab for source text and citations.",
+        answer=answer,
+        confidence=(
+            "AI-generated from the top retrieved report evidence and passed corrective quality review. "
+            "Review the Evidence tab for source paths and citations."
+        ),
         evidence=evidence,
         can_answer=True,
     )
