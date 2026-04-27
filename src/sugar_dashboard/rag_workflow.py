@@ -221,6 +221,46 @@ def _month_from_question(question: str) -> str | None:
     return f"{month_aliases[match.group(1).lower()]} {match.group(2)}"
 
 
+def _months_from_question(question: str) -> list[str]:
+    month_aliases = {
+        "jan": "Jan",
+        "january": "Jan",
+        "feb": "Feb",
+        "february": "Feb",
+        "mar": "Mar",
+        "march": "Mar",
+        "apr": "Apr",
+        "april": "Apr",
+        "may": "May",
+        "jun": "Jun",
+        "june": "Jun",
+        "jul": "Jul",
+        "july": "Jul",
+        "aug": "Aug",
+        "august": "Aug",
+        "sep": "Sep",
+        "sept": "Sep",
+        "september": "Sep",
+        "oct": "Oct",
+        "october": "Oct",
+        "nov": "Nov",
+        "november": "Nov",
+        "dec": "Dec",
+        "december": "Dec",
+    }
+    matches = re.findall(
+        r"\b(jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t|tember)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\s+(20\d{2})\b",
+        question,
+        flags=re.IGNORECASE,
+    )
+    months: list[str] = []
+    for month, year in matches:
+        label = f"{month_aliases[month.lower()]} {year}"
+        if label not in months:
+            months.append(label)
+    return months
+
+
 def _month_scoring_terms(month: str) -> set[str]:
     aliases = {
         "Jan": {"jan", "january"},
@@ -285,7 +325,7 @@ def _classify_question_with_keywords(question: str) -> QuestionIntent:
         intent = "price_estimate"
     elif any(phrase in lowered for phrase in ("how does this dashboard", "how is this dashboard", "what does this dashboard", "how are the values", "how is pydantic", "what is pydantic")):
         intent = "dashboard_help"
-    elif "available reports" in lowered or "loaded reports" in lowered or "latest price" in lowered or "latest ny11" in lowered:
+    elif "available reports" in lowered or "loaded reports" in lowered or "latest price" in lowered or "latest ny11" in lowered or "compare" in terms:
         intent = "data_lookup"
     elif terms.intersection({"define", "definition", "mean", "means"}) or any(
         phrase in lowered
@@ -331,7 +371,7 @@ def classify_question_intent(question: str, reports: Iterable[ProcessedReport]) 
                         "Use price_estimate only when the user asks for an expected, forecast, projected, "
                         "estimated, or forward-looking NY11/sugar price for a month after the latest loaded report. "
                         "Use data_lookup when the user asks for a specific dashboard value, latest loaded data, loaded reports, "
-                        "or a direct value available in the structured report fields. "
+                        "comparisons across months, or a direct value available in the structured report fields. "
                         "Use dashboard_help when the user asks how the app, dashboard, extraction, RAG, evidence, or implementation works. "
                         "Use general_domain_help for stable commodity-market definitions or concept explanations that do not need report evidence. "
                         "Use out_of_scope for questions unrelated to sugar markets, commodity reports, or this dashboard. "
@@ -1012,18 +1052,98 @@ def _format_price(value: float | None) -> str:
     return "N/A" if value is None else f"{value:.2f} c/lb"
 
 
+def _reports_for_comparison(requested_months: list[str], reports: list[ProcessedReport]) -> list[ProcessedReport]:
+    if len(requested_months) >= 2:
+        start_month = _parse_month_label(requested_months[0])
+        end_month = _parse_month_label(requested_months[-1])
+        if start_month is None or end_month is None:
+            return []
+        if end_month < start_month:
+            start_month, end_month = end_month, start_month
+        return [
+            report
+            for report in reports
+            if (parsed := _parse_month_label(report.month)) is not None and start_month <= parsed <= end_month
+        ]
+    if len(requested_months) == 1:
+        return [report for report in reports if report.month == requested_months[0]]
+    return reports
+
+
+def _answer_comparison_lookup_question(question: str, selected_reports: list[ProcessedReport]) -> RagAnswer:
+    price_points = [
+        (report.month, report.report_file, report.extraction.ny11_front_month_price)
+        for report in selected_reports
+        if report.extraction.ny11_front_month_price is not None
+    ]
+    if not price_points:
+        return _simple_answer(
+            question=question,
+            answer="I found the requested reports, but they do not have extracted NY11 price values to compare.",
+            confidence="No supported answer: cached NY11 values are missing for the requested comparison.",
+            source_type="Structured data lookup",
+            citation="Cached structured extraction",
+            can_answer=False,
+        )
+
+    start_month, _, start_price = price_points[0]
+    end_month, _, end_price = price_points[-1]
+    change_abs = round(end_price - start_price, 2)
+    change_pct = round((change_abs / start_price) * 100, 2) if start_price else None
+    direction = "rose" if change_abs > 0 else "fell" if change_abs < 0 else "was unchanged"
+    series = ", ".join(f"{month}: {price:.2f} c/lb" for month, _, price in price_points)
+    pct_text = f" ({change_pct:+.2f}%)" if change_pct is not None else ""
+    answer = (
+        f"NY11 {direction} from {start_price:.2f} c/lb in {start_month} to {end_price:.2f} c/lb in {end_month}, "
+        f"a change of {change_abs:+.2f} c/lb{pct_text}. Monthly extracted values: {series}."
+    )
+
+    record = EvidenceRecord(
+        source_id="structured-data:ny11-comparison",
+        source_type="Structured data lookup",
+        title="NY11 comparison",
+        month=f"{start_month} to {end_month}",
+        page_number=None,
+        text=series,
+        citation="Cached structured extraction, NY11 front-month price",
+    )
+    return RagAnswer(
+        question=question,
+        answer=answer,
+        confidence="Answered from cached structured dashboard fields across the requested month range.",
+        evidence=[
+            RetrievedEvidence(
+                record=record,
+                retrieval_score=1.0,
+                rerank_score=1.0,
+                matched_terms=tuple(sorted(_tokens(question).intersection(_tokens(answer)))),
+                search_path=f"Structured data > NY11 comparison > {start_month} to {end_month}",
+                reasoning="The classifier routed this as a structured data comparison, so all matching month rows were compared.",
+            )
+        ],
+        can_answer=True,
+    )
+
+
 def _answer_data_lookup_question(question: str, reports: Iterable[ProcessedReport]) -> RagAnswer | None:
     report_list = sorted(reports, key=lambda item: item.extraction.month_sort_key)
     if not report_list:
         return None
 
-    target_month = _month_from_question(question)
+    requested_months = _months_from_question(question)
+    lowered = question.lower()
+    is_comparison = "compare" in _tokens(question) or len(requested_months) > 1
+    if is_comparison:
+        selected_reports = _reports_for_comparison(requested_months, report_list)
+        if selected_reports:
+            return _answer_comparison_lookup_question(question, selected_reports)
+
+    target_month = requested_months[0] if requested_months else None
     selected_reports = [report for report in report_list if report.month == target_month] if target_month else [report_list[-1]]
     if not selected_reports:
         return None
     report = selected_reports[-1]
     extraction = report.extraction
-    lowered = question.lower()
 
     if "available reports" in lowered or "loaded reports" in lowered:
         answer = "Loaded reports: " + ", ".join(f"{item.month} ({item.report_file})" for item in report_list) + "."
