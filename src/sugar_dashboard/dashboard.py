@@ -9,6 +9,7 @@ import altair as alt
 import pandas as pd
 import streamlit as st
 
+from sugar_dashboard.market_data import MarketSeries, build_market_explorer_frame, fetch_market_history
 from sugar_dashboard.pipeline import latest_row, load_reports, reports_to_dataframe
 from sugar_dashboard.rag_workflow import SUGGESTED_QUESTIONS, RagAnswer, answer_report_question
 
@@ -182,6 +183,108 @@ def _build_trend_chart(frame: pd.DataFrame) -> alt.Chart:
     )
 
     return alt.layer(ny11_line, london_line).resolve_scale(y="independent").properties(height=320)
+
+
+@st.cache_data(ttl=60 * 60, show_spinner=False)
+def _load_market_history(years: int = 2) -> list[MarketSeries]:
+    return fetch_market_history(years=years)
+
+
+def _build_plotly_market_chart(plot_frame: pd.DataFrame, selected_lines: list[str], transform_mode: str):
+    import plotly.graph_objects as go
+
+    y_column = {
+        "Raw prices": "close",
+        "Indexed to 100": "indexed",
+        "Daily % change": "mom_change",
+    }[transform_mode]
+    y_title = {
+        "Raw prices": "Price",
+        "Indexed to 100": "Index",
+        "Daily % change": "Daily change (%)",
+    }[transform_mode]
+
+    figure = go.Figure()
+    for label in selected_lines:
+        line_frame = plot_frame[plot_frame["label"] == label].dropna(subset=[y_column])
+        if line_frame.empty:
+            continue
+        dash = "dash" if label.endswith("LY") else "solid"
+        figure.add_trace(
+            go.Scatter(
+                x=line_frame["display_date"],
+                y=line_frame[y_column],
+                mode="lines",
+                name=label,
+                line={"width": 2.5, "dash": dash},
+                customdata=line_frame[["date", "unit", "close"]],
+                hovertemplate=(
+                    "<b>%{fullData.name}</b><br>"
+                    "Display date: %{x|%b %d, %Y}<br>"
+                    "Source date: %{customdata[0]|%b %d, %Y}<br>"
+                    "Value: %{y:.2f}<br>"
+                    "Raw close: %{customdata[2]:.2f} %{customdata[1]}<extra></extra>"
+                ),
+            )
+        )
+
+    figure.update_layout(
+        height=460,
+        hovermode="x unified",
+        margin={"l": 20, "r": 20, "t": 30, "b": 20},
+        legend={"orientation": "h", "yanchor": "bottom", "y": 1.02, "xanchor": "left", "x": 0},
+        xaxis={"title": "Date", "rangeslider": {"visible": True}},
+        yaxis={"title": y_title},
+        template="plotly_white",
+    )
+    return figure
+
+
+def _render_market_explorer() -> None:
+    st.markdown("### Interactive Market Structure Explorer")
+    st.caption(
+        "Daily Yahoo Finance history for NY11 sugar and Brent, with last-year overlays shifted onto the current calendar for seasonal comparison."
+    )
+
+    market_series = _load_market_history(years=2)
+    errors = [series.error for series in market_series if series.error]
+    plot_frame = build_market_explorer_frame(market_series)
+    if plot_frame.empty:
+        st.info("Market history is unavailable right now. The report-based dashboard below is still available.")
+        if errors:
+            with st.expander("Market data diagnostics", expanded=False):
+                for error in errors:
+                    st.write(f"- {error}")
+        return
+
+    available_lines = sorted(plot_frame["label"].dropna().unique().tolist())
+    default_lines = [line for line in available_lines if "NY11" in line or "Brent" in line][:4]
+
+    control_col1, control_col2 = st.columns([1.5, 1])
+    with control_col1:
+        selected_lines = st.multiselect(
+            "Lines",
+            available_lines,
+            default=default_lines,
+            max_selections=6,
+            help="Select up to six traces. LY lines are last year's prices shifted forward one calendar year.",
+        )
+    with control_col2:
+        transform_mode = st.segmented_control(
+            "View",
+            ["Raw prices", "Indexed to 100", "Daily % change"],
+            default="Indexed to 100",
+        )
+
+    if not selected_lines:
+        st.info("Select at least one line to render the market explorer.")
+        return
+
+    figure = _build_plotly_market_chart(plot_frame, selected_lines, transform_mode)
+    st.plotly_chart(figure, width="stretch")
+
+    sources = ", ".join(f"{series.label}: {series.source}" for series in market_series if not series.frame.empty)
+    st.caption(f"Source: {sources}. Data is delayed and should be treated as decision support, not official settlement data.")
 
 
 def _build_market_regime_display(selected: pd.Series) -> tuple[str, str]:
@@ -414,6 +517,8 @@ def _render_dashboard_page(frame: pd.DataFrame, selected_month: str, show_raw_ev
     display_frame = frame[frame["month"] == selected_month]
     selected = display_frame.iloc[-1]
     latest = latest_row(frame)
+
+    _render_market_explorer()
 
     st.markdown("### KPI Cards")
     kpi1, kpi2, kpi3, kpi4 = st.columns(4)

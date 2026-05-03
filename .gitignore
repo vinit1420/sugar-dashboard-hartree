@@ -10,3 +10,5 @@ venv/
 env/
 .DS_Store
 Thumbs.db
+.streamlit/*.log
+data/market_history/*refresh_marker.json
