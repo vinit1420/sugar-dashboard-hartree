@@ -23,6 +23,10 @@ def _cache_path_for_report(report_path: Path) -> Path:
     return PROCESSED_DIR / f"{report_path.stem}.json"
 
 
+def _cache_path_for_report_file(report_file: str) -> Path:
+    return PROCESSED_DIR / f"{Path(report_file).stem}.json"
+
+
 def _infer_month_from_report_file(report_file: str) -> str | None:
     month_aliases = {
         "jan": "Jan",
@@ -156,9 +160,11 @@ def _derive_metrics(current: ProcessedReport | None, previous: ProcessedReport |
     )
 
 
-def _load_processed_report(cache_path: Path) -> ProcessedReport:
+def _load_processed_report(cache_path: Path, source_path: Path | None = None) -> ProcessedReport:
     payload = json.loads(cache_path.read_text(encoding="utf-8"))
     payload = _clean_cached_payload(payload)
+    if source_path is not None:
+        payload["source_path"] = str(source_path)
     payload.pop("month", None)
     extraction_payload = payload.get("extraction", {})
     if isinstance(extraction_payload, dict):
@@ -179,6 +185,48 @@ def _save_processed_report(report: ProcessedReport, cache_path: Path) -> None:
     )
 
 
+def _extract_price_tab_pair(report: ProcessedReport, label: str) -> tuple[float | None, float | None]:
+    number_pattern = re.compile(r"^-?\d+(?:,\d{3})*(?:\.\d+)?$")
+    for page in report.page_text:
+        lines = [line.strip() for line in page.text.splitlines() if line.strip()]
+        for index, line in enumerate(lines):
+            if line.lower() != label.lower():
+                continue
+
+            numbers: list[float] = []
+            for candidate in lines[index + 1 : index + 12]:
+                normalized = candidate.replace(",", "")
+                if number_pattern.match(normalized):
+                    numbers.append(float(normalized))
+                if len(numbers) >= 2:
+                    return numbers[0], numbers[1]
+    return None, None
+
+
+def _fill_missing_price_tab_values(reports: list[ProcessedReport]) -> list[ProcessedReport]:
+    refreshed = list(reports)
+    brent_pairs_by_month = {
+        report.month: _extract_price_tab_pair(report, "Brent Oil")
+        for report in refreshed
+    }
+
+    for index, report in enumerate(refreshed):
+        extraction = report.extraction.model_copy()
+        current_brent, _ = brent_pairs_by_month.get(report.month, (None, None))
+        if extraction.brent_oil is None and current_brent is not None:
+            extraction.brent_oil = current_brent
+
+        if extraction.brent_oil is None and index + 1 < len(refreshed):
+            _, next_report_previous_brent = brent_pairs_by_month.get(refreshed[index + 1].month, (None, None))
+            if next_report_previous_brent is not None:
+                extraction.brent_oil = next_report_previous_brent
+
+        if extraction is not report.extraction:
+            refreshed[index] = report.model_copy(update={"extraction": extraction})
+
+    return refreshed
+
+
 def load_reports(force_reextract: bool = False) -> list[ProcessedReport]:
     settings = get_settings()
     PROCESSED_DIR.mkdir(parents=True, exist_ok=True)
@@ -193,7 +241,7 @@ def load_reports(force_reextract: bool = False) -> list[ProcessedReport]:
     for report_path in report_paths:
         cache_path = _cache_path_for_report(report_path)
         if cache_path.exists() and not force_reextract:
-            processed.append(_load_processed_report(cache_path))
+            processed.append(_load_processed_report(cache_path, source_path=report_path))
             continue
 
         if extractor is None:
@@ -220,13 +268,14 @@ def load_reports(force_reextract: bool = False) -> list[ProcessedReport]:
         processed.append(report)
 
     processed.sort(key=lambda item: item.extraction.month_sort_key)
+    processed = _fill_missing_price_tab_values(processed)
 
     previous: ProcessedReport | None = None
     updated_reports: list[ProcessedReport] = []
     for report in processed:
         refreshed = report.model_copy(update={"derived_metrics": _derive_metrics(report, previous)})
         updated_reports.append(refreshed)
-        _save_processed_report(refreshed, _cache_path_for_report(Path(report.source_path)))
+        _save_processed_report(refreshed, _cache_path_for_report_file(report.report_file))
         previous = refreshed
 
     return updated_reports

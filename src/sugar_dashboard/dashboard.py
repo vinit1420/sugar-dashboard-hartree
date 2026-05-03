@@ -157,6 +157,95 @@ def _list_value(value: Any) -> list[str]:
     return [str(item) for item in value if not _is_missing(item)]
 
 
+def _selected_context(selected: pd.Series) -> str:
+    parts = [
+        _optional_text(selected.get("market_regime")),
+        _optional_text(selected.get("key_driver")),
+        _optional_text(selected.get("macro_summary")),
+        _optional_text(selected.get("supply_summary")),
+        _optional_text(selected.get("trade_summary")),
+        _optional_text(selected.get("major_trade_disruption")),
+        _optional_text(selected.get("market_positioning_note")),
+        _optional_text(selected.get("extracted_text_preview")),
+    ]
+    parts.extend(_list_value(selected.get("what_changed")))
+    parts.extend(_list_value(selected.get("why_it_matters")))
+    return " ".join(part for part in parts if part).lower()
+
+
+def _derive_regime_from_context(context: str) -> str | None:
+    bullish_terms = (
+        "tightening supply",
+        "tighten",
+        "tight",
+        "support prices",
+        "supportive",
+        "bullish",
+        "rally",
+        "short covering",
+        "higher ethanol",
+        "upward price momentum",
+    )
+    bearish_terms = (
+        "comfortable surplus",
+        "bearish",
+        "declined",
+        "decreased",
+        "lower prices",
+        "short positions",
+        "limiting any upward",
+        "stronger than expected",
+        "surplus",
+    )
+    bullish_score = sum(1 for term in bullish_terms if term in context)
+    bearish_score = sum(1 for term in bearish_terms if term in context)
+    if bearish_score > bullish_score:
+        return "Bearish / surplus pressure"
+    if bullish_score > bearish_score:
+        return "Supportive / upside risk"
+    if bullish_score or bearish_score:
+        return "Mixed / event-driven"
+    return None
+
+
+def _derive_key_driver_from_context(selected: pd.Series) -> str | None:
+    explicit = _optional_text(selected.get("key_driver"))
+    if explicit:
+        return explicit
+
+    context = _selected_context(selected)
+    if "comfortable surplus" in context and "thailand" in context:
+        return "Stronger Thailand/China output and rebuilt short positioning pressured NY11."
+    if "middle east" in context and "oil" in context:
+        return "Middle East conflict and oil/ethanol linkage drove sugar risk."
+    if "ethanol" in context and "sugar mix" in context:
+        return "Brazil ethanol parity and sugar-mix uncertainty are the key watch points."
+
+    what_changed = _list_value(selected.get("what_changed"))
+    if what_changed:
+        return what_changed[0]
+    why_it_matters = _list_value(selected.get("why_it_matters"))
+    if why_it_matters:
+        return why_it_matters[0]
+    return None
+
+
+def _derive_market_summary_from_context(selected: pd.Series) -> str | None:
+    explicit = _optional_text(selected.get("macro_summary"))
+    if explicit:
+        return explicit
+
+    context = _selected_context(selected)
+    if "comfortable surplus" in context:
+        return "Global balance moved toward surplus as stronger Thailand and China output offset weaker areas."
+    if "large net short" in context or "short positions" in context:
+        return "Speculative shorts are limiting upside but could become a covering catalyst."
+    why_it_matters = _list_value(selected.get("why_it_matters"))
+    if why_it_matters:
+        return why_it_matters[0]
+    return None
+
+
 def _build_trend_chart(frame: pd.DataFrame) -> alt.Chart:
     plot_frame = frame.copy()
     plot_frame["report_month"] = pd.Categorical(
@@ -290,15 +379,7 @@ def _render_market_explorer() -> None:
 def _build_market_regime_display(selected: pd.Series) -> tuple[str, str]:
     extracted_regime = _optional_text(selected["market_regime"])
     derived_regime = _optional_text(selected["regime_label"])
-    context = " ".join(
-        part
-        for part in [
-            _optional_text(selected["macro_summary"]),
-            _optional_text(selected["key_driver"]),
-            _optional_text(selected["trade_summary"]),
-        ]
-        if part
-    ).lower()
+    context = _selected_context(selected)
 
     bullish_signals = (
         "price higher",
@@ -333,20 +414,20 @@ def _build_market_regime_display(selected: pd.Series) -> tuple[str, str]:
     elif extracted_regime:
         primary = extracted_regime
     else:
-        primary = derived_regime or "N/A"
+        primary = derived_regime or _derive_regime_from_context(context) or "N/A"
 
     if primary:
         primary = re.sub(r"^\w", lambda match: match.group(0).upper(), primary)
     helper = (
         _optional_text(selected["macro_summary"])
-        or _optional_text(selected["key_driver"])
+        or _derive_key_driver_from_context(selected)
         or "No regime context extracted."
     )
     return primary, helper
 
 
 def _build_key_driver_display(selected: pd.Series) -> tuple[str, str]:
-    primary = _text_value(selected["key_driver"], "N/A")
+    primary = _derive_key_driver_from_context(selected) or "N/A"
     helper = "Main market-moving catalyst for the selected month."
     return primary, helper
 
@@ -404,13 +485,16 @@ def _render_trade_section(selected: pd.Series) -> None:
             ),
         )
     with col2:
+        key_driver_value, _ = _build_key_driver_display(selected)
+        regime_value, _ = _build_market_regime_display(selected)
+        market_summary = _derive_market_summary_from_context(selected)
         _section_card(
             "Market Tone",
             "<br>".join(
                 [
-                    f"<strong>Key driver:</strong> {_text_value(selected['key_driver'], 'No key driver extracted.')}",
-                    f"<strong>Market regime:</strong> {_text_value(selected['market_regime'], 'No regime extracted.')}",
-                    f"<strong>Why traders care:</strong> {_text_value(selected['macro_summary'], 'No concise market framing extracted.')}",
+                    f"<strong>Key driver:</strong> {key_driver_value if key_driver_value != 'N/A' else 'No key driver extracted.'}",
+                    f"<strong>Market regime:</strong> {regime_value if regime_value != 'N/A' else 'No regime extracted.'}",
+                    f"<strong>Why traders care:</strong> {market_summary or 'No concise market framing extracted.'}",
                 ]
             ),
         )

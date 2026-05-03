@@ -7,7 +7,7 @@
     "ny11_front_month_price": 15.87,
     "ny11_price_change_pct": 15.0,
     "london5_front_month_price": null,
-    "brent_oil": null,
+    "brent_oil": 118.35,
     "market_regime": "Bearish",
     "key_driver": "Middle East conflict impact on oil prices",
     "brazil_cane_crush_mmt": 626.0,
@@ -47,7 +47,7 @@
     "ny11_mom_change_abs": 1.42,
     "ny11_mom_change_pct": 9.83,
     "ny11_direction": "Up",
-    "brent_direction": null,
+    "brent_direction": "Up",
     "regime_label": "Bearish"
   },
   "extracted_at": "2026-04-16T20:25:21.403567",
