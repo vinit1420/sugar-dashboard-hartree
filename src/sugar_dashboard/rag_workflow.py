@@ -223,8 +223,33 @@ DOMAIN_TERMS = {
 }
 
 
+_PAGE_INDEX_CACHE: dict[tuple[tuple[str, str, int], ...], list["PageIndexNode"]] = {}
+_PAGE_LOOKUP_CACHE: dict[tuple[tuple[str, str, int], ...], dict[tuple[str, int], str]] = {}
+_REPORT_EVIDENCE_CACHE: dict[tuple[tuple[str, str, int], ...], list["EvidenceRecord"]] = {}
+_ANSWER_CACHE: dict[tuple[str, tuple[tuple[str, str, int], ...]], "RagAnswer"] = {}
+_RECORD_TERMS_CACHE: dict[tuple[str, str], set[str]] = {}
+
+
+def _reports_cache_key(reports: Iterable[ProcessedReport]) -> tuple[tuple[str, str, int], ...]:
+    return tuple(
+        (
+            report.report_file,
+            report.extracted_at.isoformat(),
+            len(report.page_text),
+        )
+        for report in reports
+    )
+
+
 def _tokens(value: str) -> set[str]:
     return {token for token in re.findall(r"[a-z0-9]+", value.lower()) if token not in STOP_WORDS}
+
+
+def _record_terms(record: EvidenceRecord) -> set[str]:
+    cache_key = (record.source_id, record.text)
+    if cache_key not in _RECORD_TERMS_CACHE:
+        _RECORD_TERMS_CACHE[cache_key] = _tokens(" ".join([record.source_type, record.title, record.month, record.text]))
+    return _RECORD_TERMS_CACHE[cache_key]
 
 
 def _month_from_question(question: str) -> str | None:
@@ -351,9 +376,16 @@ def _classify_question_with_keywords(question: str) -> QuestionIntent:
 
 def classify_question_intent(question: str, reports: Iterable[ProcessedReport]) -> QuestionIntent:
     report_list = list(reports)
+    keyword_intent = _classify_question_with_keywords(question)
+    if keyword_intent.intent != "report_qa":
+        return keyword_intent
+
     settings = get_settings()
     if not settings.openai_api_key:
-        return _classify_question_with_keywords(question)
+        return keyword_intent
+
+    if question.strip().endswith("?") and _tokens(question).intersection(DOMAIN_TERMS):
+        return keyword_intent
 
     loaded_months = ", ".join(report.month for report in sorted(report_list, key=lambda item: item.extraction.month_sort_key))
     latest_month = _latest_report_month(report_list) or "unknown"
@@ -482,8 +514,13 @@ def _structured_summary_records(report: ProcessedReport) -> list[EvidenceRecord]
 
 
 def build_report_evidence(reports: Iterable[ProcessedReport]) -> list[EvidenceRecord]:
+    report_list = list(reports)
+    cache_key = _reports_cache_key(report_list)
+    if cache_key in _REPORT_EVIDENCE_CACHE:
+        return _REPORT_EVIDENCE_CACHE[cache_key]
+
     records: list[EvidenceRecord] = []
-    for report in reports:
+    for report in report_list:
         records.extend(_structured_summary_records(report))
         for page in report.page_text:
             for chunk_index, chunk in enumerate(_split_page_text(page.text), start=1):
@@ -498,6 +535,7 @@ def build_report_evidence(reports: Iterable[ProcessedReport]) -> list[EvidenceRe
                         citation=f"{report.report_file}, page {page.page_number}",
                     )
                 )
+    _REPORT_EVIDENCE_CACHE[cache_key] = records
     return records
 
 
@@ -678,8 +716,13 @@ def _build_section_nodes(report: ProcessedReport, report_index: int, page) -> tu
 
 def build_page_index(reports: Iterable[ProcessedReport]) -> list[PageIndexNode]:
     """Build a compact, PageIndex-style report > page > section hierarchy."""
+    report_list = list(reports)
+    cache_key = _reports_cache_key(report_list)
+    if cache_key in _PAGE_INDEX_CACHE:
+        return _PAGE_INDEX_CACHE[cache_key]
+
     index: list[PageIndexNode] = []
-    for report_index, report in enumerate(reports, start=1):
+    for report_index, report in enumerate(report_list, start=1):
         page_nodes = tuple(
             PageIndexNode(
                 title=f"{report.month} report page {page.page_number}",
@@ -707,6 +750,7 @@ def build_page_index(reports: Iterable[ProcessedReport]) -> list[PageIndexNode]:
                 children=page_nodes,
             )
         )
+    _PAGE_INDEX_CACHE[cache_key] = index
     return index
 
 
@@ -716,6 +760,18 @@ def _flatten_page_index(nodes: Iterable[PageIndexNode]) -> list[PageIndexNode]:
         flattened.append(node)
         flattened.extend(_flatten_page_index(node.children))
     return flattened
+
+
+def _page_lookup_for_reports(reports: Iterable[ProcessedReport]) -> dict[tuple[str, int], str]:
+    report_list = list(reports)
+    cache_key = _reports_cache_key(report_list)
+    if cache_key not in _PAGE_LOOKUP_CACHE:
+        _PAGE_LOOKUP_CACHE[cache_key] = {
+            (report.report_file, page.page_number): page.text
+            for report in report_list
+            for page in report.page_text
+        }
+    return _PAGE_LOOKUP_CACHE[cache_key]
 
 
 def _format_page_index(nodes: Iterable[PageIndexNode], max_summary_characters: int = 420) -> str:
@@ -850,21 +906,14 @@ def retrieve_pageindex_evidence(
     scoped_reports = list(reports)
     index_nodes = build_page_index(scoped_reports)
     per_month_limit = max(1, min(top_k, 2))
-    page_lookup = {
-        (report.report_file, page.page_number): page.text
-        for report in scoped_reports
-        for page in report.page_text
-    }
-
-    ai_evidence = _retrieve_pageindex_with_ai(question, index_nodes, page_lookup, top_k=top_k)
-    if ai_evidence:
-        return _ensure_month_coverage(ai_evidence, index_nodes, page_lookup, per_month_limit=per_month_limit, top_k=top_k)
+    page_lookup = _page_lookup_for_reports(scoped_reports)
 
     page_records = [
         _page_node_to_record(node, page_lookup)
         for node in _flatten_page_index(index_nodes)
         if ".s" in node.node_id
     ]
+
     fallback = retrieve_evidence(question, page_records, top_k=top_k)
     fallback_evidence = [
         RetrievedEvidence(
@@ -877,6 +926,13 @@ def retrieve_pageindex_evidence(
         )
         for item in fallback
     ]
+    if _has_enough_support(question, fallback_evidence):
+        return _ensure_month_coverage(fallback_evidence, index_nodes, page_lookup, per_month_limit=per_month_limit, top_k=top_k)
+
+    ai_evidence = _retrieve_pageindex_with_ai(question, index_nodes, page_lookup, top_k=top_k)
+    if ai_evidence:
+        return _ensure_month_coverage(ai_evidence, index_nodes, page_lookup, per_month_limit=per_month_limit, top_k=top_k)
+
     return _ensure_month_coverage(fallback_evidence, index_nodes, page_lookup, per_month_limit=per_month_limit, top_k=top_k)
 
 
@@ -944,7 +1000,7 @@ def retrieve_evidence(
         if target_month and record.month != target_month:
             continue
 
-        record_terms = _tokens(" ".join([record.source_type, record.title, record.month, record.text]))
+        record_terms = _record_terms(record)
         matched_terms = tuple(sorted(scoring_terms.intersection(record_terms)))
         if not matched_terms:
             continue
@@ -1535,9 +1591,13 @@ def _heuristic_quality_check(question: str, answer: str, evidence: list[Retrieve
 
 
 def _check_answer_quality(question: str, answer: str, evidence: list[RetrievedEvidence]) -> AnswerQualityCheck:
+    heuristic = _heuristic_quality_check(question, answer, evidence)
+    if heuristic.passes:
+        return heuristic
+
     settings = get_settings()
     if not settings.openai_api_key:
-        return _heuristic_quality_check(question, answer, evidence)
+        return heuristic
 
     try:
         client = OpenAI(api_key=settings.openai_api_key)
@@ -1570,7 +1630,7 @@ def _check_answer_quality(question: str, answer: str, evidence: list[RetrievedEv
     except OpenAIError:
         pass
 
-    return _heuristic_quality_check(question, answer, evidence)
+    return heuristic
 
 
 def _make_quality_failure_answer(
@@ -1593,31 +1653,46 @@ def _make_quality_failure_answer(
 
 def answer_report_question(question: str, reports: Iterable[ProcessedReport]) -> RagAnswer:
     report_list = list(reports)
-    question_intent = classify_question_intent(question, report_list)
+    normalized_question = question.strip()
+    cache_key = (normalized_question.lower(), _reports_cache_key(report_list))
+    if cache_key in _ANSWER_CACHE:
+        return _ANSWER_CACHE[cache_key]
+
+    question_intent = classify_question_intent(normalized_question, report_list)
     if question_intent.intent == "price_estimate":
-        estimate_answer = _answer_price_estimate_question(question, report_list, question_intent.target_month)
+        estimate_answer = _answer_price_estimate_question(normalized_question, report_list, question_intent.target_month)
         if estimate_answer is not None:
+            _ANSWER_CACHE[cache_key] = estimate_answer
             return estimate_answer
     if question_intent.intent == "dashboard_help":
-        return _answer_dashboard_help_question(question)
+        answer = _answer_dashboard_help_question(normalized_question)
+        _ANSWER_CACHE[cache_key] = answer
+        return answer
     if question_intent.intent == "general_domain_help":
-        return _answer_general_domain_question(question)
+        answer = _answer_general_domain_question(normalized_question)
+        _ANSWER_CACHE[cache_key] = answer
+        return answer
     if question_intent.intent == "out_of_scope":
-        return _answer_out_of_scope_question(question)
+        answer = _answer_out_of_scope_question(normalized_question)
+        _ANSWER_CACHE[cache_key] = answer
+        return answer
     if question_intent.intent == "data_lookup":
-        lookup_answer = _answer_data_lookup_question(question, report_list)
+        lookup_answer = _answer_data_lookup_question(normalized_question, report_list)
         if lookup_answer is not None:
+            _ANSWER_CACHE[cache_key] = lookup_answer
             return lookup_answer
 
-    scoped_reports = _reports_for_question(question, report_list)
-    if _is_brazil_supply_question(question):
-        return _answer_brazil_supply_question(question, scoped_reports)
+    scoped_reports = _reports_for_question(normalized_question, report_list)
+    if _is_brazil_supply_question(normalized_question):
+        answer = _answer_brazil_supply_question(normalized_question, scoped_reports)
+        _ANSWER_CACHE[cache_key] = answer
+        return answer
 
-    evidence = retrieve_pageindex_evidence(question, scoped_reports)
+    evidence = retrieve_pageindex_evidence(normalized_question, scoped_reports)
 
-    if not _has_enough_support(question, evidence):
-        return RagAnswer(
-            question=question,
+    if not _has_enough_support(normalized_question, evidence):
+        answer = RagAnswer(
+            question=normalized_question,
             answer=(
                 "I can't answer that from the ED&F Man sugar reports currently loaded in the dashboard. "
                 "Try asking about sugar prices, NY11, Brazil, India, Thailand, oil/ethanol, trade flows, macro drivers, or supply risks."
@@ -1626,23 +1701,27 @@ def answer_report_question(question: str, reports: Iterable[ProcessedReport]) ->
             evidence=evidence,
             can_answer=False,
         )
+        _ANSWER_CACHE[cache_key] = answer
+        return answer
 
-    answer = _generate_ai_answer(question, evidence)
-    quality = _check_answer_quality(question, answer, evidence)
+    answer_text = _generate_ai_answer(normalized_question, evidence)
+    quality = _check_answer_quality(normalized_question, answer_text, evidence)
     if not quality.passes:
         corrective_feedback = (
             f"Critique: {quality.critique}. Missing points: {', '.join(quality.missing_points) or 'none listed'}. "
             "Revise to directly answer the question using only supplied evidence. "
             "If this is a comparison, cover each requested month/period explicitly."
         )
-        answer = _generate_ai_answer(question, evidence, corrective_feedback=corrective_feedback)
-        quality = _check_answer_quality(question, answer, evidence)
+        answer_text = _generate_ai_answer(normalized_question, evidence, corrective_feedback=corrective_feedback)
+        quality = _check_answer_quality(normalized_question, answer_text, evidence)
         if not quality.passes:
-            return _make_quality_failure_answer(question, evidence, quality)
+            answer = _make_quality_failure_answer(normalized_question, evidence, quality)
+            _ANSWER_CACHE[cache_key] = answer
+            return answer
 
-    return RagAnswer(
-        question=question,
-        answer=answer,
+    answer = RagAnswer(
+        question=normalized_question,
+        answer=answer_text,
         confidence=(
             "AI-generated from the top retrieved report evidence and passed corrective quality review. "
             "Review the Evidence tab for source paths and citations."
@@ -1650,3 +1729,5 @@ def answer_report_question(question: str, reports: Iterable[ProcessedReport]) ->
         evidence=evidence,
         can_answer=True,
     )
+    _ANSWER_CACHE[cache_key] = answer
+    return answer

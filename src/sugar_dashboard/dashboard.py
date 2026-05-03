@@ -325,13 +325,30 @@ def _render_report_rag_demo(reports: list) -> None:
         with suggestion_cols[index % 2]:
             if st.button(suggestion, key=f"rag_suggestion_{index}", width="stretch"):
                 st.session_state["report_rag_question"] = suggestion
+                st.session_state["report_rag_run_requested"] = True
 
     default_question = SUGGESTED_QUESTIONS[0]
     if "report_rag_question" not in st.session_state:
         st.session_state["report_rag_question"] = default_question
 
-    question = st.text_input("Ask a question", key="report_rag_question")
-    result = answer_report_question(question, reports)
+    with st.form("report_rag_form"):
+        question = st.text_input("Ask a question", key="report_rag_question")
+        submitted = st.form_submit_button("Run retrieval", width="stretch")
+
+    should_run = submitted or st.session_state.pop("report_rag_run_requested", False)
+    if should_run:
+        status = st.status("Thinking through the loaded reports...", expanded=True)
+        status.write("Building the report context.")
+        status.write("Retrieving the most relevant evidence sections.")
+        status.write("Drafting a grounded answer and checking support.")
+        with st.spinner("Generating answer..."):
+            st.session_state["report_rag_last_result"] = answer_report_question(question, reports)
+        status.update(label="Answer ready", state="complete", expanded=False)
+
+    result = st.session_state.get("report_rag_last_result")
+    if result is None:
+        st.info("Choose a suggested question or type one and click Run retrieval.")
+        return
 
     answer_tab, evidence_tab = st.tabs(["Answer", "Evidence"])
 
