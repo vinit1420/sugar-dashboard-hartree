@@ -653,12 +653,14 @@ def _render_evidence_panel(selected: pd.Series, show_raw_evidence: bool) -> None
             st.text(_text_value(selected["extracted_text_preview"], "No preview available."))
 
 
-def _render_dashboard_page(frame: pd.DataFrame, selected_month: str, show_raw_evidence: bool) -> None:
+def _render_dashboard_page(frame: pd.DataFrame, show_raw_evidence: bool) -> None:
+    _render_market_explorer()
+
+    month_options = frame["month"].tolist()
+    selected_month = st.selectbox("Month selector", month_options, index=len(month_options) - 1)
     display_frame = frame[frame["month"] == selected_month]
     selected = display_frame.iloc[-1]
     latest = latest_row(frame)
-
-    _render_market_explorer()
 
     st.markdown("### KPI Cards")
     kpi1, kpi2, kpi3, kpi4 = st.columns(4)
@@ -743,8 +745,6 @@ def run_app() -> None:
         st.stop()
 
     if page == "Dashboard":
-        month_options = frame["month"].tolist()
-        selected_month = st.selectbox("Month selector", month_options, index=len(month_options) - 1)
-        _render_dashboard_page(frame, selected_month, show_raw_evidence)
+        _render_dashboard_page(frame, show_raw_evidence)
     else:
         _render_ask_question_page(reports)
