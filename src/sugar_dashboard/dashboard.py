@@ -5,7 +5,6 @@ import re
 from collections import defaultdict
 from typing import Any
 
-import altair as alt
 import pandas as pd
 import streamlit as st
 
@@ -244,34 +243,6 @@ def _derive_market_summary_from_context(selected: pd.Series) -> str | None:
     if why_it_matters:
         return why_it_matters[0]
     return None
-
-
-def _build_trend_chart(frame: pd.DataFrame) -> alt.Chart:
-    plot_frame = frame.copy()
-    plot_frame["report_month"] = pd.Categorical(
-        plot_frame["month"],
-        categories=plot_frame["month"].tolist(),
-        ordered=True,
-    )
-
-    base = alt.Chart(plot_frame).encode(
-        x=alt.X("report_month:N", title="Month", sort=plot_frame["month"].tolist()),
-    )
-
-    ny11_line = base.mark_line(point=True, strokeWidth=3, color="#1f6feb").encode(
-        y=alt.Y("ny11_front_month_price:Q", title="NY11 front-month price (c/lb)"),
-        tooltip=[
-            alt.Tooltip("month:N", title="Month"),
-            alt.Tooltip("ny11_front_month_price:Q", title="NY11 (c/lb)", format=".2f"),
-            alt.Tooltip("brent_oil:Q", title="Brent ($/bbl)", format=".1f"),
-        ],
-    )
-
-    london_line = base.mark_line(point=True, strokeDash=[6, 4], strokeWidth=2, color="#f59e0b").encode(
-        y=alt.Y("brent_oil:Q", title="Brent oil ($/bbl)"),
-    )
-
-    return alt.layer(ny11_line, london_line).resolve_scale(y="independent").properties(height=320)
 
 
 @st.cache_data(ttl=60 * 60, show_spinner=False)
@@ -717,13 +688,6 @@ def _render_dashboard_page(frame: pd.DataFrame, selected_month: str, show_raw_ev
             key_driver_value,
             f"{key_driver_help} Selected month: {selected['month']}",
         )
-
-    st.markdown("### Price Trend")
-    st.altair_chart(_build_trend_chart(frame), width="stretch")
-    caption = (
-        "Blue shows NY11 in cents per pound, while the dashed amber line shows Brent in dollars per barrel so you can compare direction rather than absolute level."
-    )
-    st.caption(caption)
 
     st.markdown("### Supply Drivers")
     _render_supply_section(selected)
