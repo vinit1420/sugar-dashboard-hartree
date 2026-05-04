@@ -279,19 +279,73 @@ def _load_market_history(years: int = 2) -> list[MarketSeries]:
     return fetch_market_history(years=years)
 
 
-def _build_plotly_market_chart(plot_frame: pd.DataFrame, selected_lines: list[str], transform_mode: str):
+def _default_market_window(plot_frame: pd.DataFrame) -> tuple[pd.Timestamp, pd.Timestamp, pd.Timestamp] | None:
+    ny11_frame = plot_frame[plot_frame["label"] == "NY11 Sugar Continuous"].dropna(subset=["display_date", "close"])
+    if ny11_frame.empty:
+        return None
+    latest_date = pd.to_datetime(ny11_frame["display_date"]).max()
+    start_date = latest_date - pd.DateOffset(months=1)
+    end_date = latest_date + pd.DateOffset(days=10)
+    return start_date, end_date, latest_date
+
+
+def _market_default_lines(available_lines: list[str]) -> list[str]:
+    preferred = [
+        "NY11 Sugar Continuous",
+        "Brent Crude Continuous",
+        "NY11 Sugar Continuous LY",
+        "Brent Crude Continuous LY",
+    ]
+    defaults = [line for line in preferred if line in available_lines]
+    if defaults:
+        return defaults
+    return [line for line in available_lines if "NY11" in line or "Brent" in line][:4]
+
+
+def _selected_market_window(
+    plot_frame: pd.DataFrame,
+    default_window: tuple[pd.Timestamp, pd.Timestamp, pd.Timestamp] | None,
+) -> tuple[pd.Timestamp, pd.Timestamp, pd.Timestamp] | None:
+    if default_window is None:
+        return None
+
+    default_start, default_end, latest_date = default_window
+    available_dates = pd.to_datetime(plot_frame["display_date"].dropna())
+    if available_dates.empty:
+        return default_window
+
+    selected_range = st.date_input(
+        "Date range",
+        value=(default_start.date(), default_end.date()),
+        min_value=available_dates.min().date(),
+        max_value=max(available_dates.max().date(), default_end.date()),
+        help="Defaults to one month before the latest continuous NY11 close through ten days after it. Expand this range for broader context.",
+        key="market_explorer_date_range_v2",
+    )
+    if not isinstance(selected_range, tuple) or len(selected_range) != 2:
+        return default_window
+
+    selected_start, selected_end = pd.Timestamp(selected_range[0]), pd.Timestamp(selected_range[1])
+    if selected_start > selected_end:
+        selected_start, selected_end = selected_end, selected_start
+    return selected_start, selected_end, latest_date
+
+
+def _build_plotly_market_chart(
+    plot_frame: pd.DataFrame,
+    selected_lines: list[str],
+    transform_mode: str,
+    market_window: tuple[pd.Timestamp, pd.Timestamp, pd.Timestamp] | None,
+):
     import plotly.graph_objects as go
 
-    y_column = {
-        "Raw prices": "close",
-        "Indexed to 100": "indexed",
-        "Daily % change": "mom_change",
-    }[transform_mode]
-    y_title = {
-        "Raw prices": "Price",
-        "Indexed to 100": "Index",
-        "Daily % change": "Daily change (%)",
-    }[transform_mode]
+    y_column = "mom_change" if transform_mode == "Daily % change" else "close"
+    if market_window:
+        start_date, end_date, _ = market_window
+        plot_frame = plot_frame[
+            (pd.to_datetime(plot_frame["display_date"]) >= start_date)
+            & (pd.to_datetime(plot_frame["display_date"]) <= end_date)
+        ]
 
     figure = go.Figure()
     for label in selected_lines:
@@ -299,12 +353,14 @@ def _build_plotly_market_chart(plot_frame: pd.DataFrame, selected_lines: list[st
         if line_frame.empty:
             continue
         dash = "dash" if label.endswith("LY") else "solid"
+        axis_name = "y2" if transform_mode == "NY11 / Brent axes" and "Brent" in label else "y"
         figure.add_trace(
             go.Scatter(
                 x=line_frame["display_date"],
                 y=line_frame[y_column],
                 mode="lines",
                 name=label,
+                yaxis=axis_name,
                 line={"width": 2.5, "dash": dash},
                 customdata=line_frame[["date", "unit", "close"]],
                 hovertemplate=(
@@ -317,15 +373,35 @@ def _build_plotly_market_chart(plot_frame: pd.DataFrame, selected_lines: list[st
             )
         )
 
+    xaxis_config = {"title": "Date", "rangeslider": {"visible": True}}
+    if market_window:
+        start_date, end_date, _ = market_window
+        xaxis_config["range"] = [start_date, end_date]
+
+    yaxis_config: dict[str, Any] = {"title": "Price"}
+    yaxis2_config: dict[str, Any] | None = None
+    if transform_mode == "NY11 / Brent axes":
+        yaxis_config = {"title": "NY11 Sugar (c/lb)"}
+        yaxis2_config = {
+            "title": "Brent crude ($/bbl)",
+            "overlaying": "y",
+            "side": "right",
+            "showgrid": False,
+        }
+    elif transform_mode == "Daily % change":
+        yaxis_config = {"title": "Daily change (%)"}
+
     figure.update_layout(
         height=460,
         hovermode="x unified",
         margin={"l": 20, "r": 20, "t": 30, "b": 20},
         legend={"orientation": "h", "yanchor": "bottom", "y": 1.02, "xanchor": "left", "x": 0},
-        xaxis={"title": "Date", "rangeslider": {"visible": True}},
-        yaxis={"title": y_title},
+        xaxis=xaxis_config,
+        yaxis=yaxis_config,
         template="plotly_white",
     )
+    if yaxis2_config:
+        figure.update_layout(yaxis2=yaxis2_config)
     return figure
 
 
@@ -346,10 +422,11 @@ def _render_market_explorer() -> None:
                     st.write(f"- {error}")
         return
 
+    default_market_window = _default_market_window(plot_frame)
     available_lines = sorted(plot_frame["label"].dropna().unique().tolist())
-    default_lines = [line for line in available_lines if "NY11" in line or "Brent" in line][:4]
+    default_lines = _market_default_lines(available_lines)
 
-    control_col1, control_col2 = st.columns([1.5, 1])
+    control_col1, control_col2, control_col3 = st.columns([1.35, 0.95, 1.2])
     with control_col1:
         selected_lines = st.multiselect(
             "Lines",
@@ -361,19 +438,27 @@ def _render_market_explorer() -> None:
     with control_col2:
         transform_mode = st.segmented_control(
             "View",
-            ["Raw prices", "Indexed to 100", "Daily % change"],
-            default="Indexed to 100",
+            ["Raw prices", "NY11 / Brent axes", "Daily % change"],
+            default="NY11 / Brent axes",
         )
+    with control_col3:
+        market_window = _selected_market_window(plot_frame, default_market_window)
 
     if not selected_lines:
         st.info("Select at least one line to render the market explorer.")
         return
 
-    figure = _build_plotly_market_chart(plot_frame, selected_lines, transform_mode)
+    figure = _build_plotly_market_chart(plot_frame, selected_lines, transform_mode, market_window)
     st.plotly_chart(figure, width="stretch")
 
     sources = ", ".join(f"{series.label}: {series.source}" for series in market_series if not series.frame.empty)
     st.caption(f"Source: {sources}. Data is delayed and should be treated as decision support, not official settlement data.")
+    if market_window:
+        start_date, end_date, latest_date = market_window
+        st.caption(
+            "Default window is anchored to the latest available continuous NY11 close "
+            f"({latest_date:%b %d, %Y}), from {start_date:%b %d, %Y} to {end_date:%b %d, %Y}."
+        )
 
 
 def _build_market_regime_display(selected: pd.Series) -> tuple[str, str]:
